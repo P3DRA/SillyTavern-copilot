@@ -1,0 +1,21 @@
+# The shipped extension repository.
+#
+# This is a SEPARATE git repository, nested inside the user's SillyTavern
+# checkout on purpose: SillyTavern's own `.git` makes the install a nested repo
+# boundary, so the outer repository physically cannot track any file in here.
+# Keeping our history separate also means the user's ST history is never
+# polluted by our commits. See REPORT.md, "decisions made where GOAL.md was silent".
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Never commit a key. The shipped extension has no key and must never read
+# secret.md; see GOAL.md 9.2.
+*.key
+secret.md
