@@ -250,14 +250,36 @@ export function coerceSwipeRecord(raw) {
     }
     const rec = emptySwipeRecord();
     rec.version = Number.isInteger(raw.version) ? raw.version : SCHEMA_VERSION;
+    // Reference-preserving on purpose (trap 15): a read must never REPLACE the
+    // nested objects — replacing them silently detaches every reference a
+    // caller captured (a compression mark written through such a reference
+    // would vanish on the next read, which is exactly how the torture test
+    // caught it). Valid parts keep their identity and only get defaults
+    // filled in; invalid parts are rebuilt.
     if (raw.extraction && typeof raw.extraction === 'object' && isNonEmptyString(raw.extraction.text)) {
-        rec.extraction = makeExtraction(raw.extraction);
+        Object.assign(raw.extraction, makeExtraction(raw.extraction));
+        rec.extraction = raw.extraction;
+    }
+    // ADDED (phase 6): merged (compressed) entries the record carries beyond
+    // its own extraction slot. Without this the normalise-on-read would DELETE
+    // them (the unknown-key sweep) and compression would silently lose its own
+    // output.
+    if (Array.isArray(raw.extractions)) {
+        const kept = raw.extractions.filter((e) => e && typeof e === 'object' && isNonEmptyString(e.text));
+        for (const e of kept) {
+            Object.assign(e, makeExtraction(e));
+        }
+        if (kept.length > 0) {
+            rec.extractions = kept;
+        }
     }
     if (raw.composer && typeof raw.composer === 'object' && isNonEmptyString(raw.composer.text)) {
-        rec.composer = makeComposer(raw.composer);
+        Object.assign(raw.composer, makeComposer(raw.composer));
+        rec.composer = raw.composer;
     }
     if (raw.injection && typeof raw.injection === 'object') {
-        rec.injection = makeInjection(raw.injection);
+        Object.assign(raw.injection, makeInjection(raw.injection));
+        rec.injection = raw.injection;
     }
     if (Array.isArray(raw.history)) {
         rec.history = raw.history.filter((h) => h && typeof h === 'object');

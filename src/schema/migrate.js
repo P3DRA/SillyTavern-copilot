@@ -89,7 +89,10 @@ export function migrateRecord(raw, ctx = {}) {
 
     let record;
     try {
-        record = coerceSwipeRecord(raw);
+        // A dry run must not touch the live data. coerceSwipeRecord fills
+        // defaults onto nested objects for reference stability (trap 15) — on a
+        // dry run that fill would be a silent edit, so work on a clone.
+        record = coerceSwipeRecord(ctx.dryRun ? structuredClone(raw) : raw);
     } catch (err) {
         return {
             record: null,
@@ -181,7 +184,7 @@ export function migrateChat(chat, opts = {}) {
                 continue;
             }
             report.inspected += 1;
-            const result = migrateRecord(root.record, { messageIndex: mi, swipeIndex: si });
+            const result = migrateRecord(root.record, { messageIndex: mi, swipeIndex: si, dryRun: opts.dryRun === true });
             if (result.status === 'future') {
                 report.future += 1;
                 report.problems.push({ messageIndex: mi, swipeIndex: si, problem: result.problem });

@@ -303,16 +303,72 @@ export function collectExtractions(chat, opts = {}) {
             && entry.swipeIndex === opts.excludeSwipeAt.swipeIndex) {
             continue;
         }
-        if (entry.record.extraction && !isCompressedAway(entry.record.extraction)) {
-            out.push({
-                extraction: entry.record.extraction,
-                messageIndex: entry.messageIndex,
-                swipeIndex: entry.swipeIndex,
-            });
+        // The record's own extraction PLUS any merged (compressed) entries the
+        // record carries in `extractions[]` — each hidden only when it was
+        // itself merged away (I2).
+        const all = [
+            ...(entry.record.extraction ? [entry.record.extraction] : []),
+            ...(Array.isArray(entry.record.extractions) ? entry.record.extractions.filter(Boolean) : []),
+        ];
+        for (const extraction of all) {
+            if (!isCompressedAway(extraction)) {
+                out.push({
+                    extraction,
+                    messageIndex: entry.messageIndex,
+                    swipeIndex: entry.swipeIndex,
+                });
+            }
         }
     }
     out.sort((a, b) => a.extraction.createdAt - b.extraction.createdAt || a.messageIndex - b.messageIndex);
     return out;
+}
+
+/**
+ * Append a MERGED extraction (a compression result) to a record's extra
+ * extraction list. The record's own `extraction` slot is never touched — that
+ * is why merged entries need their own list (I1/I2: compression creates new
+ * records and destroys nothing).
+ *
+ * @param {object} message
+ * @param {number} swipeIndex
+ * @param {object} extraction A makeExtraction() record.
+ * @returns {object|null} the live record, or null when not writable.
+ */
+export function appendExtraExtraction(message, swipeIndex, extraction) {
+    const record = ensureSwipeRecord(message, swipeIndex);
+    if (!Array.isArray(record.extractions)) {
+        record.extractions = [];
+    }
+    record.extractions.push(extraction);
+    mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
+    return record;
+}
+
+/**
+ * Remove a merged extraction by id (used by undo, which must restore the
+ * previous state exactly).
+ * @param {object} message
+ * @param {number} swipeIndex
+ * @param {string} extractionId
+ */
+export function removeExtraExtraction(message, swipeIndex, extractionId) {
+    const record = readSwipeRecordOrNull(message, swipeIndex);
+    if (!record || !Array.isArray(record.extractions)) {
+        return false;
+    }
+    const before = record.extractions.length;
+    record.extractions = record.extractions.filter((e) => e && e.id !== extractionId);
+    if (record.extractions.length === before) {
+        return false;
+    }
+    if (record.extractions.length === 0) {
+        // Undo must restore the state BYTE-identically (I2) — an empty array
+        // key left behind would still be a difference.
+        delete record.extractions;
+    }
+    mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
+    return true;
 }
 
 /**
