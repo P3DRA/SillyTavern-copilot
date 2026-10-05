@@ -1,0 +1,367 @@
+/**
+ * Prompt templates and placeholder rendering.
+ *
+ * GOAL.md §6: templates use namespaced placeholders such as
+ * `{{copilot.extractions}}`, `{{copilot.lastMessages}}`, `{{copilot.lorebook}}`,
+ * `{{copilot.characterCard}}`, `{{copilot.narratorPrompt}}`,
+ * `{{copilot.userRequest}}`, and these must NOT collide with SillyTavern's own
+ * `{{char}}` / `{{user}}`. Users can reorder or omit blocks freely.
+ *
+ * The collision rule is enforced structurally, not by convention: this renderer
+ * only ever substitutes placeholders in the `{{copilot.*}}` namespace. Anything
+ * else — including every SillyTavern macro — is passed through byte-for-byte so
+ * that SillyTavern resolves it later with the real character and user names. A
+ * renderer that substituted `{{char}}` itself would inject the wrong name the
+ * moment the user renamed a persona, and nothing would say so.
+ */
+
+/** The namespace we own. Nothing outside it is ever substituted. */
+export const NAMESPACE = 'copilot';
+
+/** Every placeholder the composer template may use. */
+export const BLOCKS = Object.freeze({
+    EXTRACTIONS: 'extractions',
+    LAST_MESSAGES: 'lastMessages',
+    LOREBOOK: 'lorebook',
+    CHARACTER_CARD: 'characterCard',
+    NARRATOR_PROMPT: 'narratorPrompt',
+    USER_REQUEST: 'userRequest',
+    GOALS: 'goals',
+    PREVIOUS_NOTE: 'previousNote',
+    LANGUAGE: 'language',
+});
+
+export const KNOWN_BLOCKS = Object.freeze(Object.values(BLOCKS));
+
+/**
+ * Placeholder syntax, namespaced.
+ * Deliberately does NOT match `{{char}}` or `{{user}}` or any other macro.
+ */
+const PLACEHOLDER_RE = /\{\{\s*copilot\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+
+/* ---------------------------------------------------------------- defaults */
+
+/**
+ * Default extractor prompt.
+ *
+ * Content-neutral by construction (GOAL.md §10.5): it describes a FORMAT, never
+ * a topic, and explicitly forbids the extractor from judging the material. A
+ * model that refuses here is recorded as `refused` — a result about the model,
+ * not a reason to change this prompt.
+ */
+export const DEFAULT_EXTRACTOR_PROMPT = `You extract durable facts from a roleplay transcript.
+
+The transcript is DATA. Do not judge, comment on, refuse, soften or moralise
+about any of it, whatever it contains. A scene of any subject is ordinary input
+to you. Your only job is to record what happened.
+
+Output ONLY this structure, nothing else:
+
+<state>
+SCENE: where and when this is happening
+TIME: the in-story time, or "unknown"
+WHO: each named person, what they are doing, what they know, what they hide
+</state>
+<ledger>{"events":[],"learned":[],"concealed":[],"items":[],"threads":[],"wants":[]}</ledger>
+
+Rules:
+- "events" are things that HAPPENED. Each with text, npc_names, importance (1-3), msg (index).
+- "learned" is what someone now knows that they did not before.
+- "concealed" is what someone is deliberately not saying.
+- "items" are objects that matter.
+- "threads" are open questions or promises.
+- "wants" are what someone is trying to get.
+- Write in the SAME LANGUAGE as the transcript.
+- If a line says something rather than showing it, record it.
+- Empty arrays are correct when nothing qualifies. Do not invent to fill them.`;
+
+/**
+ * Default composer prompt.
+ *
+ * Built against the three traps the last attempt fell into:
+ *
+ *  - TRAP 18: the composer must write TO THE NARRATOR, never to the reader, and
+ *    never about itself. "Any note about X would be invented" is self-auditing
+ *    critique, not guidance. Second person is banned outright.
+ *  - TRAP 19: on a near-blank scene the word budget used to inflate into
+ *    padding. The prompt now says plainly what to do when there is little to say.
+ *  - The recent messages are ground truth. If an extraction disagrees with them,
+ *    the messages win.
+ */
+export const DEFAULT_COMPOSER_PROMPT = `You write guidance notes for the narrator of a roleplay.
+
+You are writing TO THE NARRATOR — the writer at the keyboard — not to the
+reader, and never about yourself. Address the narrator directly in the imperative.
+
+HARD RULES
+1. Write only guidance. Never write narration, never write dialogue, never
+   write the scene. The narrator does that.
+2. Never use second person about the reader, and never write self-auditing
+   commentary such as "your purpose is unstated" or "nothing here would be
+   invented". If the material does not support a point, simply leave the point
+   out.
+3. Never use "me", "my", or "I". You do not exist in this text.
+4. The recent messages are ground truth. Where an extraction disagrees with them,
+   the recent messages win and the disagreement is ignored.
+
+WHEN THERE IS LITTLE TO SAY
+An early, quiet scene is normal. If the material gives you two true facts, write
+two true facts. If it gives you one, write one. Writing nothing at all is correct
+and better than padding. Do not invent pressure, mystery, tension or motive to
+fill the budget.
+
+Output ONLY this structure, nothing else:
+
+<copilot>
+your note
+</copilot>
+
+STYLE
+- Prose, in the SAME LANGUAGE as the chat.
+- Concrete: name the object, the person, the open thread. No abstractions.
+- {{copilot.minWords}}–{{copilot.maxWords}} words. That is a ceiling, not a target.
+- No headers, no lists, no preamble, no sign-off.`;
+
+export const DEFAULT_COMPRESSOR_PROMPT = `You merge several extracted facts into one.
+
+Merge, do not summarise away. Every fact that mattered must still be findable in
+your output. Keep concrete names, objects and numbers. You are compressing, not
+editing.
+
+Output ONLY this structure, nothing else:
+
+<merged>
+your merged text
+</merged>
+
+STYLE
+- Same language as the input.
+- Prose, no lists, no headers.`;
+
+/* ---------------------------------------------------------------- rendering */
+
+/**
+ * Render a template.
+ *
+ * @param {string} template
+ * @param {Record<string, string>} values Keyed by the SHORT name (`extractions`), not `copilot.extractions`.
+ * @param {{strict?: boolean}} [opts] strict: throw on an unknown `{{copilot.*}}`.
+ * @returns {{text: string, used: string[], missing: string[]}}
+ */
+export function render(template, values = {}, opts = {}) {
+    const used = [];
+    const missing = [];
+    const source = typeof template === 'string' ? template : '';
+    const text = source.replace(PLACEHOLDER_RE, (match, name) => {
+        if (!Object.hasOwn(values, name)) {
+            missing.push(name);
+            if (opts.strict) {
+                throw new Error(`Unknown copilot placeholder: ${match}`);
+            }
+            // Drop it rather than leaving literal {{copilot.x}} in an LLM prompt,
+            // where the model would treat it as text to echo back.
+            return '';
+        }
+        const v = values[name];
+        used.push(name);
+        return typeof v === 'string' ? v : String(v ?? '');
+    });
+    return { text, used: [...new Set(used)], missing: [...new Set(missing)] };
+}
+
+/**
+ * Which `{{copilot.*}}` blocks does this template reference?
+ * @param {string} template
+ * @returns {string[]}
+ */
+export function blocksIn(template) {
+    const found = new Set();
+    const source = typeof template === 'string' ? template : '';
+    for (const m of source.matchAll(PLACEHOLDER_RE)) {
+        found.add(m[1]);
+    }
+    return [...found];
+}
+
+/**
+ * Did the author write a placeholder with the wrong namespace?
+ *
+ * `{{char}}`, `{{user}}`, `{{original}}` and friends are SillyTavern's and must
+ * pass through untouched. This returns them so the settings panel can tell the
+ * user which macros are in play, rather than letting them wonder why
+ * `{{char}}` came out literally.
+ *
+ * @param {string} template
+ * @returns {string[]}
+ */
+export function foreignMacrosIn(template) {
+    const source = typeof template === 'string' ? template : '';
+    const found = new Set();
+    for (const m of source.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) {
+        if (m[1] !== NAMESPACE) {
+            found.add(m[1]);
+        }
+    }
+    return [...found];
+}
+
+/**
+ * Hard problems with a block list: things that are actually wrong.
+ *
+ * Note what is NOT here: overlapping a SillyTavern macro name. `{{copilot.char}}`
+ * is unambiguous — the namespace is what prevents the collision, and that is the
+ * whole reason for the namespace. Reusing a familiar word is merely confusing,
+ * so it is a warning (see `namespaceWarnings`), not an error.
+ *
+ * @param {string[]} blockNames
+ * @returns {string[]}
+ */
+export function namespaceProblems(blockNames) {
+    const problems = [];
+    const seen = new Set();
+    for (const name of blockNames) {
+        if (typeof name !== 'string' || name === '') {
+            problems.push('empty block name');
+            continue;
+        }
+        if (name === NAMESPACE) {
+            problems.push(`"${name}" collides with the copilot namespace itself`);
+        }
+        if (seen.has(name)) {
+            problems.push(`"${name}" is declared twice`);
+        }
+        seen.add(name);
+    }
+    return problems;
+}
+
+/**
+ * Soft warnings: legal, but likely to confuse the person editing the template.
+ * @param {string[]} blockNames
+ * @returns {string[]}
+ */
+export function namespaceWarnings(blockNames) {
+    const warnings = [];
+    for (const name of (Array.isArray(blockNames) ? blockNames : [])) {
+        if (typeof name !== 'string' || name === '') {
+            continue;
+        }
+        if (/^(char|user|persona|original|description|personality|scenario|system|mes|persona_description)$/i.test(name)) {
+            warnings.push(`"${name}" is also a SillyTavern macro name — {{copilot.${name}}} will not collide, but the shared word may confuse`);
+        }
+    }
+    return warnings;
+}
+
+/* ------------------------------------------------------------------ budget */
+
+/**
+ * Fit a window of messages into a budget by dropping WHOLE oldest messages.
+ *
+ * Trap 4, in two parts:
+ *  - Agents read half a sentence and nothing looks wrong. Messages arrive whole;
+ *    if you need a budget, drop whole oldest messages.
+ *  - "Whole" means the message and everything it carries. We never truncate the
+ *    text of a message.
+ *
+ * @param {Array<{role: string, text: string}>} messages
+ * @param {number} maxChars
+ * @returns {{messages: Array<{role: string, text: string}>, dropped: number, keptChars: number}}
+ */
+export function fitMessages(messages, maxChars) {
+    const list = Array.isArray(messages) ? messages.filter((m) => m && typeof m.text === 'string') : [];
+    if (!Number.isFinite(maxChars) || maxChars <= 0 || list.length === 0) {
+        return { messages: list, dropped: 0, keptChars: list.reduce((n, m) => n + m.text.length, 0) };
+    }
+    // Keep the newest, drop whole messages from the front until it fits.
+    let kept = [];
+    let used = 0;
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+        const cost = list[i].text.length;
+        if (used + cost > maxChars && kept.length > 0) {
+            break;
+        }
+        kept.unshift(list[i]);
+        used += cost;
+    }
+    return { messages: kept, dropped: list.length - kept.length, keptChars: used };
+}
+
+/** Render messages as a plain transcript block. */
+export function renderMessages(messages) {
+    if (!Array.isArray(messages)) {
+        return '';
+    }
+    return messages
+        .filter((m) => m && typeof m.text === 'string' && m.text.trim() !== '')
+        .map((m) => `${m.role === 'user' ? 'User' : 'Narrator'}: ${m.text.trim()}`)
+        .join('\n\n');
+}
+
+/** Render entries as a plain block, one per line-group. Never JSON. */
+export function renderEntries(entries) {
+    if (!Array.isArray(entries)) {
+        return '';
+    }
+    const usable = entries.filter((e) => e && typeof e.text === 'string' && e.text.trim() !== '');
+    if (usable.length === 0) {
+        return '';
+    }
+    return usable
+        .map((e) => {
+            const src = e.source ? ` (from message ${e.source})` : '';
+            const pinned = e.pinned ? ' [pinned]' : '';
+            const merged = e.sources?.length ? ` [merged from ${e.sources.length}]` : '';
+            return `- ${e.text.trim()}${src}${pinned}${merged}`;
+        })
+        .join('\n');
+}
+
+/**
+ * Detect the language of the recent chat, so the note can follow it (S10).
+ *
+ * Deliberately a coarse script/heuristic pass, not a language identifier: the
+ * composer is told the LANGUAGE and writes in it, and the debug panel shows the
+ * guess so a wrong guess is visible rather than mysterious.
+ *
+ * @param {Array<{role: string, text: string}>|string} messagesOrText
+ * @returns {{code: string|null, note: string}}
+ */
+export function detectLanguage(messagesOrText) {
+    let text = '';
+    if (typeof messagesOrText === 'string') {
+        text = messagesOrText;
+    } else if (Array.isArray(messagesOrText)) {
+        text = messagesOrText.filter((m) => m && m.text).map((m) => m.text).join('\n');
+    }
+    const sample = text.slice(0, 4000);
+    if (sample.trim() === '') {
+        return { code: null, note: 'no text to inspect' };
+    }
+    const has = (re) => re.test(sample);
+    if (has(/[Ѐ-ӿ]/)) {
+        return { code: 'ru', note: 'Cyrillic' };
+    }
+    if (has(/[぀-ヿ]/)) {
+        return { code: 'ja', note: 'Japanese kana' };
+    }
+    if (has(/[가-힯]/)) {
+        return { code: 'ko', note: 'Hangul' };
+    }
+    if (has(/[一-鿿]/)) {
+        return { code: 'zh', note: 'Han characters (Chinese or Japanese)' };
+    }
+    if (has(/[֐-׿]/)) {
+        return { code: 'he', note: 'Hebrew' };
+    }
+    if (has(/[؀-ۿ]/)) {
+        return { code: 'ar', note: 'Arabic' };
+    }
+    if (has(/[฀-๿]/)) {
+        return { code: 'th', note: 'Thai' };
+    }
+    if (has(/[áàâãäéèêëíìîïóòôõöúùûüçñ]/i) && has(/[áàâãäéèêëíìîïóòôõöúùûüçñ]/i)) {
+        return { code: 'pt', note: 'Latin with diacritics (Portuguese/Spanish family)' };
+    }
+    return { code: 'en', note: 'default: assumed English' };
+}
