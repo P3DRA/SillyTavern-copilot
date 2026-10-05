@@ -112,6 +112,9 @@ const REFUSAL_OPENINGS = [
 const NON_PROSE = [
     /^\s*[[{][\s\S]*[\]}]\s*$/,       // a bare JSON object/array
     /^\s*```[\s\S]*```\s*$/,           // a bare code fence
+    /^\s*```/,                         // an UNTERMINATED fence: the model started a code block
+                                         // and never closed it. This is what truncated or
+                                         // derailed output looks like, and it is not prose.
     /^\s*[\w.]+@[\w.]+\s*$/,           // an email
 ];
 

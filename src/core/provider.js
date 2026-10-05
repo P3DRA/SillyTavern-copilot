@@ -246,6 +246,8 @@ export async function attempt(args) {
  * @param {object} args
  * @param {string[]} args.models          Fallback chain, in order.
  * @param {number} [args.retries]         Attempts per model before moving on.
+ * @param {boolean} [args.allowRefusal]   Keep a refusal's TEXT in the result for
+ *   the record. It never becomes usable output — see below.
  * @param {(event: object) => void} [args.onEvent]
  * @returns {Promise<{ok: boolean, text: string, model: string|null, attempts: object[], deadKey: boolean, summary: string}>}
  */
@@ -256,6 +258,8 @@ export async function callWithFallback(args) {
     const chain = (Array.isArray(models) ? models : []).filter(Boolean);
     /** @type {object[]} */
     const attempts = [];
+    /** The first refusal seen, kept so its TEXT is never lost even if the chain fails. */
+    let firstRefusal = null;
 
     if (chain.length === 0) {
         const rec = { model: null, ok: false, reason: FAIL.NO_MODEL, detail: 'the fallback chain is empty', text: '', tokensIn: 0, tokensOut: 0 };
@@ -278,14 +282,19 @@ export async function callWithFallback(args) {
                     summary: `ok with ${model} on attempt ${tryIndex + 1}`,
                 };
             }
-            // A refusal is a real answer. §10.5: it is a RESULT about the model.
-            // Routing it to the next model is legitimate; silently retrying the
-            // same model at the same temperature is just burning money.
-            if (rec.reason === FAIL.REFUSED && allowRefusal) {
-                return {
-                    ok: true, text: rec.text, model, attempts, deadKey: false,
-                    summary: `${model} refused; content-neutral mode accepted the output`,
-                };
+            // A refusal is garbage by GOAL.md 6, so it ROUTES TO THE NEXT MODEL like any
+            // other garbage. That is not politeness: §10.4 certifies models for
+            // roles by observing which ones refuse, so walking the chain is how a
+            // model that will actually do the work gets found.
+            //
+            // What it must never do is become usable output. The text is kept for
+            // the record and the debug panel, flagged `refused`, and `ok` stays
+            // false so no caller promotes a refusal into an injected note.
+            if (rec.reason === FAIL.REFUSED) {
+                if (!firstRefusal) {
+                    firstRefusal = { text: rec.text, model };
+                }
+                onEvent({ kind: 'refused', model, detail: rec.detail });
             }
             if (rec.reason === FAIL.ABORTED) {
                 return { ok: false, text: '', model: null, attempts, deadKey: false, summary: 'aborted' };
@@ -297,13 +306,17 @@ export async function callWithFallback(args) {
         }
     }
 
+    const refusalNote = firstRefusal
+        ? ` (first refusal kept on record from ${firstRefusal.model})`
+        : '';
     return {
         ok: false,
-        text: '',
-        model: null,
+        refused: Boolean(firstRefusal),
+        text: firstRefusal?.text ?? '',
+        model: firstRefusal?.model ?? null,
         attempts,
         deadKey: false,
-        summary: `every attempt failed (${attempts.length} tried across ${chain.length} models)`,
+        summary: `every attempt failed (${attempts.length} tried across ${chain.length} models)${refusalNote}`,
     };
 }
 
