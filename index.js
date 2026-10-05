@@ -32,9 +32,13 @@ import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
     noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
 } from './src/schema/records.js';
+import { emptySpend, recordSpend, spendSummary } from './src/core/spend.js';
+import {
+    presetFromSettings, applyPreset, upsertPreset, removePreset,
+} from './src/core/presets.js';
 import { redact } from './src/core/redact.js';
 import {
-    ctx, chat, eventSource, saveChatConditional,
+    ctx, chat, eventSource, saveChatConditional, saveMetadata,
     nextToken, isCurrent, resetTokens, clearPending,
     setPending, getPending, bindToMessage, recordSkip, registerNote, clearNote,
 } from './src/st/adapter.js';
@@ -83,6 +87,17 @@ const DEFAULTS = {
     // Phase 4 (§6): after a reroll composes new data, show the old-vs-new diff
     // popup (use old / use new / reroll / cancel). Set false for a silent flow.
     diffPopup: true,
+    // Phase 5 (§6): the USER-editable pricing table (per token, as OpenRouter
+    // publishes prices). Zero by default — the counter reports tokens
+    // regardless and never invents a price.
+    pricing: {
+        extractor: { prompt: 0, completion: 0 },
+        composer: { prompt: 0, completion: 0 },
+        narrator: { prompt: 0, completion: 0 },
+    },
+    // Phase 5 (§6): hot-swappable extractor/composer configuration bundles.
+    presets: [],
+    activePreset: null,
 };
 
 function settings() {
@@ -275,7 +290,13 @@ function withMeta(fn) {
     }
     const root = meta.copilot ?? (meta.copilot = {});
     const res = fn(root) ?? { ok: true, reason: null };
-    saveMetadata();
+    try {
+        saveMetadata();
+    } catch (err) {
+        // The mutation is already applied in memory; a metadata save failure
+        // must say so loudly but never lose or block the edit.
+        log.warn('store', `metadata save failed: ${redact(String(err?.message ?? err))}`);
+    }
     return res;
 }
 
@@ -319,6 +340,74 @@ function removeRequest(id) {
         log.info('goals', 'request removed');
         return { ok: true, reason: null };
     });
+}
+
+/* ------------------------------------------------------ spend and presets */
+
+/**
+ * The spend counter (§6): provider-reported usage only, priced by the USER's
+ * table. Per-chat state (chat_metadata.copilot.spend), so totals survive a
+ * reload and never leak between chats.
+ */
+function recordRoleSpend(role, usage) {
+    const u = { tokensIn: usage?.tokensIn ?? 0, tokensOut: usage?.tokensOut ?? 0 };
+    const price = settings().pricing?.[role] ?? {};
+    withMeta((root) => {
+        root.spend = root.spend ?? emptySpend();
+        recordSpend(root.spend, role, u, price);
+        return { ok: true, reason: null };
+    });
+    if (u.tokensIn || u.tokensOut) {
+        log.info('spend', `${role}: +${u.tokensIn}/${u.tokensOut} provider-reported tokens`);
+    } else {
+        log.info('spend', `${role}: no provider usage reported (streamed?) — counted as zero`);
+    }
+}
+
+/** Current per-chat spend totals, per role and combined. */
+function spendTotals() {
+    return spendSummary(ctx().chatMetadata?.copilot?.spend ?? emptySpend());
+}
+
+// Presets are USER configuration, not chat data — they live in the extension
+// settings and survive across chats (§6: hot-swappable bundles).
+function savePreset(name) {
+    const s = settings();
+    const preset = presetFromSettings(name, s);
+    if (!preset.name) {
+        return { ok: false, reason: 'a preset needs a name' };
+    }
+    saveSettings({ presets: upsertPreset(s.presets ?? [], preset), activePreset: preset.id });
+    log.info('presets', `preset saved: "${preset.name}"`);
+    return { ok: true, reason: null, id: preset.id };
+}
+
+function applyPresetById(id) {
+    const s = settings();
+    const preset = (s.presets ?? []).find((p) => p.id === id);
+    if (!preset) {
+        return { ok: false, reason: 'preset not found' };
+    }
+    const patch = applyPreset(preset);
+    // saveSettings merges shallowly — merge the role configs ourselves so a
+    // preset swap never drops fields it does not carry.
+    saveSettings({
+        extractor: { ...s.extractor, ...patch.extractor },
+        composer: { ...s.composer, ...patch.composer },
+        activePreset: id,
+    });
+    log.info('presets', `preset applied: "${preset.name}"`);
+    return { ok: true, reason: null, name: preset.name };
+}
+
+function deletePreset(id) {
+    const s = settings();
+    saveSettings({
+        presets: removePreset(s.presets ?? [], id),
+        activePreset: s.activePreset === id ? null : s.activePreset,
+    });
+    log.info('presets', 'preset deleted');
+    return { ok: true, reason: null };
 }
 
 /* ---------------------------------------------------------------- injection */
@@ -563,6 +652,19 @@ async function onPromptReady(eventData, kind) {
 }
 
 async function injectInto(payload, shape) {
+    // ST's EventEmitter SWALLOWS listener errors (eventemitter.js:145-151:
+    // console.error + continue with the generation). A throw in here would
+    // silently send the request without the note — exactly the failure shape
+    // that cost this project its first seven turns. Whatever happens lands in
+    // the log (trap 14).
+    try {
+        await injectIntoUnsafe(payload, shape);
+    } catch (err) {
+        log.error('inject', `injection threw — the request continues WITHOUT the note: ${redact(String(err?.message ?? err))}`);
+    }
+}
+
+async function injectIntoUnsafe(payload, shape) {
     const token = currentTokenSafe();
     if (injectedTokens.has(token)) {
         log.info('inject', `already injected for token ${token} — ignoring the duplicate hook (trap: fires twice)`);
@@ -572,8 +674,11 @@ async function injectInto(payload, shape) {
     const s = settings();
     const turn = log.turn(String(token));
 
-    let note = lastNote;
-    /** @type {object} what bindToMessage() will write for the composer role */
+    // S5/I5: garbage output ends the turn with NO note — the chat continues.
+    // The previous note is reused ONLY by explicit user choice (the reroll
+    // popup's "reuse"), never as a silent fallback: injecting stale guidance
+    // after a failed compose is exactly the quiet divergence §6 forbids.
+    let note = null;
     let composerRecord = null;
     let extractionRecord = null;
 
@@ -612,6 +717,15 @@ async function injectInto(payload, shape) {
                 },
             });
 
+            // Spend (phase 5): provider-reported usage per role, counted even
+            // when the attempt failed — it was spent regardless.
+            if (composed.spend?.extractor) {
+                recordRoleSpend('extractor', composed.spend.extractor);
+            }
+            if (composed.spend?.composer) {
+                recordRoleSpend('composer', composed.spend.composer);
+            }
+
             // Panel detail (§6): what each role was asked, and every attempt on
             // the fallback chain with its raw output — failures shown, not hidden.
             turn.inputs = composed.inputs ?? null;
@@ -621,6 +735,8 @@ async function injectInto(payload, shape) {
                 ok: a.ok === true,
                 reason: a.reason ?? null,
                 attemptIndex: a.attemptIndex ?? 0,
+                tokensIn: a.tokensIn ?? 0,
+                tokensOut: a.tokensOut ?? 0,
                 text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
             }));
 
@@ -678,7 +794,8 @@ async function injectInto(payload, shape) {
     }
 
     if (!note) {
-        recordSkip(log, SKIP.NO_NOTE, turn.failure?.detail ?? turn.failure?.reason ?? '', token);
+        recordSkip(log, SKIP.NO_NOTE, turn.failure?.detail ?? turn.failure?.reason ?? '', token,
+            extractionRecord ?? turn.extraction ?? null);
         injectedTokens.add(token);
         return;
     }
@@ -823,10 +940,12 @@ function installWatcher() {
     }
     watcherInstalled = true;
     window.fetch = async function copilotWatchedFetch(input, init) {
+        let watched = false;
         try {
             const url = typeof input === 'string' ? input : (input?.url ?? '');
             const isBackend = /\/api\/backends\/(chat-completions|text-completions)\/generate/.test(url);
             if (isBackend && typeof init?.body === 'string') {
+                watched = true;
                 const turn = log.turn(String(currentTokenSafe()));
                 turn.outgoingPromptSeen = true;
                 turn.outgoingBody = init.body;
@@ -841,7 +960,24 @@ function installWatcher() {
         } catch (err) {
             log.error('outgoing', `watcher failed: ${redact(String(err?.message ?? err))}`);
         }
-        return original(input, init);
+        const res = await original(input, init);
+        if (watched) {
+            // Spend (§6): the NARRATOR's provider-reported usage, read from the
+            // response. A streamed response reports nothing (PROBLEMS.md §4) —
+            // counted as zero and SAID so, never estimated.
+            try {
+                res.clone().json().then((body) => {
+                    const u = body?.usage;
+                    recordRoleSpend('narrator', {
+                        tokensIn: u?.prompt_tokens ?? 0,
+                        tokensOut: u?.completion_tokens ?? 0,
+                    });
+                }).catch(() => {
+                    log.info('spend', 'narrator: response carried no JSON usage (streamed?) — counted as zero');
+                });
+            } catch { /* unreadable response — nothing to count */ }
+        }
+        return res;
     };
     log.info('boot', 'outgoing-request watcher installed (GOAL.md 10.8)');
 }
@@ -879,6 +1015,8 @@ function installPanel() {
                 </div>
                 <pre class="copilot-body"></pre>
                 <div class="copilot-goals"></div>
+                <div class="copilot-presets"></div>
+                <div class="copilot-spend"></div>
                 <div class="copilot-records"></div>
             </div>
         </div>`;
@@ -971,6 +1109,96 @@ function installPanel() {
         renderGoals();
     });
 
+    // ---- Presets (phase 5, §6): hot-swappable extractor/composer bundles.
+    const presetsEl = panel.querySelector('.copilot-presets');
+    const renderPresets = () => {
+        try {
+            const s = settings();
+            const list = s.presets ?? [];
+            presetsEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>presets</strong></div>
+                <div class="copilot-gr-add">
+                    <select data-gr="preset-select">
+                        ${list.map((p) => `<option value="${escapeHtml(p.id)}"${p.id === s.activePreset ? ' selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+                    </select>
+                    <button type="button" data-act="apply-preset">Apply</button>
+                    <button type="button" data-act="delete-preset">Delete</button>
+                </div>
+                <div class="copilot-gr-add">
+                    <input type="text" data-gr="preset-name" placeholder="new preset name (saves the current config)" />
+                    <button type="button" data-act="save-preset">Save current as preset</button>
+                </div>`;
+        } catch (err) {
+            presetsEl.textContent = `presets unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    presetsEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act]');
+        if (!btn) {
+            return;
+        }
+        const val = (name) => presetsEl.querySelector(`[data-gr="${name}"]`)?.value ?? '';
+        if (btn.dataset.act === 'save-preset') {
+            const name = val('preset-name').trim();
+            if (name) {
+                savePreset(name);
+            }
+        } else if (btn.dataset.act === 'apply-preset') {
+            applyPresetById(val('preset-select'));
+        } else if (btn.dataset.act === 'delete-preset') {
+            deletePreset(val('preset-select'));
+        }
+        renderPresets();
+        render();
+    });
+
+    // ---- The spend counter (phase 5, §6): user-editable per-token prices and
+    // provider-reported totals, per role and combined.
+    const spendEl = panel.querySelector('.copilot-spend');
+    const renderSpend = () => {
+        try {
+            const s = settings();
+            const p = s.pricing ?? {};
+            const t = spendTotals();
+            const row = (role) => `
+                <div class="copilot-gr-add">
+                    <span class="copilot-spend-role">${role}</span>
+                    <input type="text" data-price="${role}-prompt" value="${escapeHtml(String(p[role]?.prompt ?? 0))}" size="10" title="price per input token" />
+                    <input type="text" data-price="${role}-completion" value="${escapeHtml(String(p[role]?.completion ?? 0))}" size="10" title="price per output token" />
+                    <span class="copilot-spend-total">${t.roles[role].tokensIn}/${t.roles[role].tokensOut} tok · $${t.roles[role].costUsd.toFixed(6)} · ${t.roles[role].calls} calls</span>
+                </div>`;
+            spendEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>spend</strong> <em class="copilot-spend-note">provider-reported usage only; prices are per token, yours to edit</em></div>
+                ${row('extractor')}
+                ${row('composer')}
+                ${row('narrator')}
+                <div class="copilot-gr-add">
+                    <span class="copilot-spend-role">combined</span>
+                    <span class="copilot-spend-total">${t.combined.tokensIn}/${t.combined.tokensOut} tok · $${t.combined.costUsd.toFixed(6)} · ${t.combined.calls} calls</span>
+                    <button type="button" data-act="save-prices">Save prices</button>
+                </div>`;
+        } catch (err) {
+            spendEl.textContent = `spend unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    spendEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act="save-prices"]');
+        if (!btn) {
+            return;
+        }
+        const price = (name) => Number(spendEl.querySelector(`[data-price="${name}"]`)?.value) || 0;
+        saveSettings({
+            pricing: {
+                extractor: { prompt: price('extractor-prompt'), completion: price('extractor-completion') },
+                composer: { prompt: price('composer-prompt'), completion: price('composer-completion') },
+                narrator: { prompt: price('narrator-prompt'), completion: price('narrator-completion') },
+            },
+        });
+        log.info('spend', 'pricing table saved');
+        renderSpend();
+        render();
+    });
+
     // ---- The log browser (phase 3, §6): every record in the chat, one card
     // layout repeated per message/swipe, each entry editable. Editing keeps the
     // old value (I1) and an extraction edit flags its composer entry stale.
@@ -1051,15 +1279,20 @@ function installPanel() {
     });
     log.subscribe(() => {
         render();
-        // Refresh the browser/goals unless the user is typing in them.
-        if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)) {
+        // Refresh the browser/goals/spend unless the user is typing in them.
+        if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
+            && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)) {
             renderRecords();
             renderGoals();
+            renderPresets();
+            renderSpend();
         }
     });
     render();
     renderRecords();
     renderGoals();
+    renderPresets();
+    renderSpend();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 
@@ -1093,6 +1326,7 @@ function init() {
         log, settings, saveSettings, BUILD_ID, runs: [],
         editNote, editExtraction,
         addGoal, completeGoal, addRequest, removeRequest, tick: tickChatState,
+        spendTotals, savePreset, applyPresetById, deletePreset,
     };
 
     log.info('boot', `copilot wired up — build ${BUILD_ID}`);

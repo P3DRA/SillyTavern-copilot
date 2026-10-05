@@ -188,6 +188,44 @@
     text-decoration: line-through;
 }
 
+/* ---- Spend counter and presets (phase 5) ---- */
+.copilot-spend-role {
+    min-width: 72px;
+    opacity: 0.8;
+}
+
+.copilot-spend-total {
+    opacity: 0.9;
+    font-variant-numeric: tabular-nums;
+}
+
+.copilot-spend-note {
+    font-style: normal;
+    font-size: 10px;
+    opacity: 0.65;
+}
+
+.copilot-presets select {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 11px;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+}
+
+.copilot-presets button {
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 3px;
+}
+
 /* ---- The diff popup (phase 4): shown inside ST's own popup ---- */
 .copilot-diff pre {
     margin: 2px 0 8px;

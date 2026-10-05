@@ -75,6 +75,9 @@ export async function runPipeline(input, deps = {}) {
         // records — this is diagnostics, not chat data.
         inputs: { extractor: '', composer: '' },
         lorebook: typeof input?.lorebook === 'string' ? input.lorebook : '',
+        // Per-role provider-reported usage for the spend counter (§6). Only
+        // what the provider reported; never estimated (spend.js).
+        spend: { extractor: null, composer: null },
     };
 
     try {
@@ -124,8 +127,11 @@ export async function runPipeline(input, deps = {}) {
             onEvent,
         });
         result.attempts.push(...extractResult.attempts);
-        result.tokensIn += extractResult.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0);
-        result.tokensOut += extractResult.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0);
+        const extIn = extractResult.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0);
+        const extOut = extractResult.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0);
+        result.tokensIn += extIn;
+        result.tokensOut += extOut;
+        result.spend.extractor = { tokensIn: extIn, tokensOut: extOut };
         result.costUsd += costUsd(
             { tokensIn: result.tokensIn, tokensOut: result.tokensOut },
             settings.pricing?.extractor,
@@ -202,6 +208,10 @@ export async function runPipeline(input, deps = {}) {
             onEvent,
         });
         result.attempts.push(...composeResult.attempts);
+        result.spend.composer = {
+            tokensIn: composeResult.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0),
+            tokensOut: composeResult.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0),
+        };
 
         if (composeResult.deadKey) {
             return Object.assign(result, { ok: false, reason: 'dead_key', detail: composeResult.summary, elapsedMs: Date.now() - started });

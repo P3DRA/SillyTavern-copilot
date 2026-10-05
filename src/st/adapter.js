@@ -259,8 +259,10 @@ export function bindToMessage(token) {
  * @param {string} reason One of SKIP.
  * @param {string} [detail]
  * @param {number} [token]
+ * @param {object|null} [extraction] I1: even a failed turn stores what the
+ *   extractor produced — nothing an automatic operation produced is dropped.
  */
-export function recordSkip(log, reason, detail = '', token = currentToken) {
+export function recordSkip(log, reason, detail = '', token = currentToken, extraction = null) {
     const taken = takePending(token);
     const list = chat();
     const messageIndex = list.length - 1;
@@ -268,6 +270,7 @@ export function recordSkip(log, reason, detail = '', token = currentToken) {
     if (message && !message.is_user) {
         const swipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
         writeSwipeRecord(message, swipeIndex, {
+            ...(extraction ? { extraction } : {}),
             injection: {
                 injected: false,
                 position: 'none',
