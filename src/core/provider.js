@@ -219,11 +219,26 @@ export async function attempt(args) {
 
     const verdict = judge(content, { tag, reasoning, minWords: args.minWords, maxWords: args.maxWords });
 
-    // Trap 17: empty content WITH reasoning means the budget was too small, not
-    // that the model misbehaved. Retry this SAME model once at 4x.
+    // Two symptoms of the same underlying cause — the model ran out of budget —
+    // and both are worth retrying on the SAME model with MORE budget before we
+    // give up on it and walk the fallback chain.
+    //
+    // THINKING_ONLY (trap 17): empty content, reasoning tokens spent. Found live:
+    // a reasoning model spends the whole allowance thinking and answers nothing.
     if (verdict.reason === REJECT.THINKING_ONLY && maxTokens < 32768) {
         onEvent({ kind: 'reasoning-budget-retry', model, from: maxTokens, to: maxTokens * 4 });
         const retry = await attempt({ ...args, maxTokens: maxTokens * 4 });
+        return { ...retry, budgetRetried: true };
+    }
+
+    // UNCLOSED_TAG (trap 4): the model opened `<copilot>` and was cut off
+    // mid-answer. Found live: mistralai/mistral-nemo did this at 700 tokens.
+    // Retrying the same model with more room is far likelier to succeed than
+    // declaring the model incapable, and the bigger cost is only paid when the
+    // small budget has already failed.
+    if (verdict.reason === REJECT.UNCLOSED_TAG && maxTokens < 32768) {
+        onEvent({ kind: 'truncation-budget-retry', model, from: maxTokens, to: maxTokens * 2 });
+        const retry = await attempt({ ...args, maxTokens: maxTokens * 2 });
         return { ...retry, budgetRetried: true };
     }
 

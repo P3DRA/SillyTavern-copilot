@@ -107,7 +107,8 @@ export function resetTokens() {
  * is what destroyed it (trap 15).
  *
  * @type {{token: number, note: string, noteHash: string|null, position: string,
- *          goalIds: string[], requestIds: string[], createdAt: number}|null}
+ *          goalIds: string[], requestIds: string[], extraction: object|null,
+ *          composer: object|null, createdAt: number}|null}
  */
 let pending = null;
 
@@ -119,6 +120,11 @@ export function setPending(note, meta = {}) {
         position: meta.position ?? 'end',
         goalIds: meta.goalIds ?? [],
         requestIds: meta.requestIds ?? [],
+        // The pipeline's own records ride along so all three outputs
+        // (extraction, composer, injection) can be saved on the swipe —
+        // the phase-1 done-when requires exactly that.
+        extraction: meta.extraction ?? null,
+        composer: meta.composer ?? null,
         createdAt: Date.now(),
     };
     return pending;
@@ -215,16 +221,22 @@ export function bindToMessage(token) {
     // ST sets swipe_id before generating, so this is the slot being written.
     const swipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
 
+    // All three pipeline outputs land on this swipe: the extraction (even when
+    // empty — I1: a failed extraction is still stored), the composer record and
+    // the injection record.
     writeSwipeRecord(message, swipeIndex, {
-        composer: {
-            text: note.note,
-            model: note.model ?? '',
-            tokensIn: note.tokensIn ?? 0,
-            tokensOut: note.tokensOut ?? 0,
-            createdAt: note.createdAt ?? Date.now(),
-            staleFlag: false,
-            edited: false,
-        },
+        extraction: note.extraction ?? { text: '', model: '', tokensIn: 0, tokensOut: 0 },
+        composer: note.composer
+            ? { ...note.composer, text: note.composer.text || note.note }
+            : {
+                text: note.note,
+                model: note.model ?? '',
+                tokensIn: note.tokensIn ?? 0,
+                tokensOut: note.tokensOut ?? 0,
+                createdAt: note.createdAt ?? Date.now(),
+                staleFlag: false,
+                edited: false,
+            },
         injection: {
             injected: true,
             position: note.position,

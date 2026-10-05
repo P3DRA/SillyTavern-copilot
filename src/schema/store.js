@@ -125,11 +125,17 @@ function mirrorToMessageExtra(message, swipeIndex, root) {
     if (!isPlainObject(message) || !Object.isExtensible(message)) {
         return;
     }
-    if (message.swipe_id !== swipeIndex) {
-        // Not the live swipe. Touching message.extra here would publish another
-        // swipe's data as the current one — worse than doing nothing.
+    if (message.swipe_id !== undefined && message.swipe_id !== swipeIndex) {
+        // A KNOWN live swipe that differs: touching message.extra here would
+        // publish another swipe's data as the current one — worse than nothing.
         return;
     }
+    // swipe_id undefined means a generation in progress — saveReply assigns
+    // swipe_id and then REBUILDS swipe_info[0] wholesale from message.extra
+    // (script.js:6744-6749). Without the mirror here, the record written at
+    // MESSAGE_RECEIVED is silently wiped moments later. The swipe being written
+    // during a generation is the swipe that is about to become live, so this is
+    // the current swipe by construction.
     try {
         if (!isPlainObject(message.extra)) {
             message.extra = {};

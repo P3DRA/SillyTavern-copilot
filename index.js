@@ -112,7 +112,13 @@ function saveSettings(patch) {
         return;
     }
     root[SETTINGS_KEY] = { ...(root[SETTINGS_KEY] ?? {}), ...patch };
-    ctx().saveExtensionSettings?.();
+    // ST persists extension_settings inside its main settings payload
+    // (script.js:7992 saveSettings -> :8026 extension_settings). There is no
+    // ctx.saveExtensionSettings — the optional-chain call that used to live here
+    // was a silent no-op and settings never reached the server. The context
+    // exposes saveSettingsDebounced (st-context.js:131); ST's own extensions
+    // (extensions.js:673) persist extension settings the same way.
+    ctx().saveSettingsDebounced?.();
 }
 
 /* ------------------------------------------------------------------- inputs */
@@ -262,7 +268,10 @@ function injectIntoString(prompt, note, opts) {
 let lastNote = null;
 
 function onGenerationStarted(type, opts = {}, dryRun = false) {
-    // Trap 14: every decline logs exactly one line.
+    // Trap 14: every decline logs exactly one line. A dry run, a quiet
+    // generation and an impersonation are NOT turns of the narrator and must
+    // not consume or advance the generation token — a token bump here once made
+    // bindToMessage() see a "stale" note that was composed seconds earlier.
     if (dryRun) {
         log.info('generation', 'dry run — no note composed');
         return;
@@ -275,7 +284,7 @@ function onGenerationStarted(type, opts = {}, dryRun = false) {
         log.info('generation', 'impersonate — the narrator is not generating');
         return;
     }
-    nextToken();
+    lastToken = nextToken();
     lorebookEntries = new Map();
     clearNote();
     clearPending(SKIP.STALE_GENERATION);
@@ -416,6 +425,8 @@ async function injectInto(payload, shape) {
     setPending(note, {
         noteHash: composed.noteHash,
         position: opts.position,
+        extraction: composed.extraction,
+        composer: composed.composer,
         model: composed.composer?.model,
         tokensIn: composed.composer?.tokensIn,
         tokensOut: composed.composer?.tokensOut,
@@ -437,7 +448,22 @@ function roleCode(role) {
 
 function onMessageReceived() {
     const token = currentTokenSafe();
-    const result = bindToMessage(token);
+    const has = getPending();
+    // Every arrival logs exactly one line (trap 14). Without this, "the record
+    // is missing" is indiagnosable: the event may not have fired, or the bind
+    // may have thrown before it logged anything.
+    log.info('store', `message received — token=${token} pending=${has ? has.token : 'none'}`);
+    if (!has) {
+        return;
+    }
+    let result;
+    try {
+        result = bindToMessage(token);
+    } catch (err) {
+        log.error('store', `bind threw: ${redact(String(err?.message ?? err))}`);
+        injectedTokens.delete(token);
+        return;
+    }
     const turn = log.turn(String(token));
     if (result.bound) {
         turn.injection = `${turn.injection ?? 'note'} -> bound to message ${result.messageIndex} swipe ${result.swipeIndex}`;
@@ -559,7 +585,10 @@ function init() {
         return;
     }
     es.on(EVENT.GENERATION_STARTED, (type, opts, dryRun) => {
-        lastToken = nextToken();
+        // The token is bumped INSIDE onGenerationStarted, and only for real
+        // narrator turns. It used to be bumped here too — twice per turn — and
+        // setPending()/bindToMessage() disagreed about the token, so every note
+        // failed to bind as "stale_generation_aborted".
         return onGenerationStarted(type, opts ?? {}, dryRun === true);
     });
     es.on(EVENT.CHAT_COMPLETION_PROMPT_READY, (data) => onPromptReady(data, EVENT.CHAT_COMPLETION_PROMPT_READY));

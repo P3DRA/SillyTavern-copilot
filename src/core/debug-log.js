@@ -25,7 +25,7 @@
  * Changes on every build of this file. Bump it when shipping a change whose
  * effect you need to be able to confirm from a pasted log.
  */
-export const BUILD_ID = 'copilot-phase1-r1';
+export const BUILD_ID = 'copilot-phase1-r4';
 
 const MAX_EVENTS = 500;
 
@@ -179,11 +179,34 @@ export function verifyInOutgoing(serialisedRequest, noteText) {
     // Compare on a distinctive slice: a note is long enough that an exact match
     // is fine, but whitespace normalisation keeps a formatting difference from
     // reading as "not injected".
-    const needle = note.trim().replace(/\s+/g, ' ');
-    const hay = body.replace(/\s+/g, ' ');
-    return {
-        found: needle !== '' && hay.includes(needle),
-        noteChars: note.length,
-        noteHash: null,
-    };
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    const needle = norm(note);
+    if (norm(body).includes(needle)) {
+        return { found: true, noteChars: note.length, noteHash: null };
+    }
+    // The JSON-ESCAPED form: inside a serialised request body a quote is \" and
+    // a newline is \n, so a note containing either reads differently in the
+    // bytes than in memory. This exact mismatch reported "NOT FOUND" for a note
+    // with a quoted phrase that was demonstrably in the request.
+    const escaped = JSON.stringify(note).slice(1, -1).trim();
+    if (escaped !== '' && body.includes(escaped)) {
+        return { found: true, noteChars: note.length, noteHash: null };
+    }
+    // Finally, parse the payload and search the message contents unescaped.
+    try {
+        const payload = JSON.parse(body);
+        const texts = [];
+        if (Array.isArray(payload?.messages)) {
+            for (const m of payload.messages) {
+                texts.push(typeof m?.content === 'string' ? m.content : '');
+            }
+        }
+        if (typeof payload?.prompt === 'string') {
+            texts.push(payload.prompt);
+        }
+        if (norm(texts.join('\n')).includes(needle)) {
+            return { found: true, noteChars: note.length, noteHash: null };
+        }
+    } catch { /* not JSON — the raw checks above already ran */ }
+    return { found: false, noteChars: note.length, noteHash: null };
 }
