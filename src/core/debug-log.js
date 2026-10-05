@@ -27,7 +27,7 @@ import { redact } from './redact.js';
  * Changes on every build of this file. Bump it when shipping a change whose
  * effect you need to be able to confirm from a pasted log.
  */
-export const BUILD_ID = 'copilot-phase2-r1';
+export const BUILD_ID = 'copilot-phase3-r1';
 
 const MAX_EVENTS = 500;
 
@@ -158,6 +158,9 @@ export class DebugLog {
             push(`  incoming prompt seen: ${t.incomingPromptSeen}`);
             push(`  outgoing request seen: ${t.outgoingPromptSeen}`);
             push(`  injection: ${t.injection ?? 'n/a'}`);
+            if (t.reroll) {
+                push(`  reroll: ${t.reroll}`);
+            }
             if (t.skipReason) {
                 push(`  FAILURES: SKIPPED: ${t.skipReason}`);
             }
@@ -174,7 +177,7 @@ export class DebugLog {
                 push(`      ${t.extraction.text}`);
             }
             if (t.composer) {
-                push(`  composer: model=${t.composer.model} tokensIn=${t.composer.tokensIn} tokensOut=${t.composer.tokensOut}${stamp(t.composer.createdAt)}`);
+                push(`  composer: model=${t.composer.model} tokensIn=${t.composer.tokensIn} tokensOut=${t.composer.tokensOut}${stamp(t.composer.createdAt)}${t.composer.staleFlag ? ` ⚠ STALE: ${t.composer.staleReason ?? 'extraction changed, may not match'}` : ''}`);
                 push('    input:');
                 for (const line of markedInput(t, 'composer')) {
                     push(line);

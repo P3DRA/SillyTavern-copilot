@@ -27,7 +27,9 @@
 import { EVENT, GENERATION_TYPE, NOTE_TAG } from './src/st/constants.js';
 import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log.js';
 import { runPipeline } from './src/core/pipeline.js';
-import { collectExtractions } from './src/schema/store.js';
+import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord } from './src/schema/store.js';
+import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
+import { noteHash } from './src/schema/records.js';
 import { redact } from './src/core/redact.js';
 import {
     ctx, chat, eventSource, saveChatConditional,
@@ -71,6 +73,11 @@ const DEFAULTS = {
     },
     maxWaitMs: 15000,
     debug: true,
+    // Phase 3 (§6): what happens on swipe/reroll. 'ask' shows a popup —
+    // "new composer note or reuse the current one" — before the generation
+    // proceeds. 'new' / 'reuse' skip the popup (useful for tests and for users
+    // who always want the same behaviour).
+    rerollMode: 'ask',
 };
 
 function settings() {
@@ -266,8 +273,37 @@ function injectIntoString(prompt, note, opts) {
 /* --------------------------------------------------------------- event wire */
 
 let lastNote = null;
+/** The user's swipe/reroll choice for the generation in flight (phase 3). */
+let rerollChoice = null;
 
-function onGenerationStarted(type, opts = {}, dryRun = false) {
+/**
+ * The swipe/reroll popup (§6: "On swipe/reroll, a popup asks: new composer note
+ * or reuse the current one"). ST AWAITS this handler (eventemitter.js:146), so
+ * the generation genuinely waits for the answer.
+ *
+ * Cancel/Escape resolves as 'reuse' — the benign answer: no model call, and the
+ * choice is recorded on the record either way.
+ */
+async function askRerollChoice() {
+    try {
+        const PopupCls = ctx().Popup;
+        if (!PopupCls?.show?.confirm) {
+            log.warn('reroll', 'no Popup in the ST context — defaulting to a new note');
+            return 'new';
+        }
+        const result = await PopupCls.show.confirm(
+            'Copilot note for this swipe',
+            'Compose a NEW composer note for this generation, or REUSE the current one?',
+            { okButton: 'Compose a new note', cancelButton: 'Reuse the current note' },
+        );
+        return result === 1 ? 'new' : 'reuse';
+    } catch (err) {
+        log.warn('reroll', `popup failed — defaulting to a new note: ${redact(String(err?.message ?? err))}`);
+        return 'new';
+    }
+}
+
+async function onGenerationStarted(type, opts = {}, dryRun = false) {
     // Trap 14: every decline logs exactly one line. A dry run, a quiet
     // generation and an impersonation are NOT turns of the narrator and must
     // not consume or advance the generation token — a token bump here once made
@@ -288,6 +324,7 @@ function onGenerationStarted(type, opts = {}, dryRun = false) {
     lorebookEntries = new Map();
     clearNote();
     clearPending(SKIP.STALE_GENERATION);
+    rerollChoice = null;
     const s = settings();
     if (!s.enabled) {
         log.info('generation', `copilot is disabled — ${SKIP.DISABLED}`);
@@ -296,6 +333,15 @@ function onGenerationStarted(type, opts = {}, dryRun = false) {
     if (!apiKey()) {
         log.warn('generation', `no API key configured — ${SKIP.NO_KEY}`);
         return;
+    }
+    // Phase 3: swipe and reroll ask first. Everything else composes as usual.
+    if (type === 'swipe' || type === 'regenerate') {
+        const mode = s.rerollMode ?? 'ask';
+        const choice = mode === 'ask' ? await askRerollChoice() : mode;
+        rerollChoice = { token: lastToken, choice };
+        log.info('reroll', mode === 'ask'
+            ? `popup answered: ${choice} (type=${type})`
+            : `rerollMode=${mode} — no popup (type=${type})`);
     }
     log.info('generation', `turn starting (type=${type}, token ${lastToken})`);
 }
@@ -382,45 +428,67 @@ async function injectInto(payload, shape) {
     const turn = log.turn(String(token));
 
     let note = lastNote;
-    const composed = await runPipeline(collectInput(token), {
-        key: apiKey(),
-        deadlineMs: s.maxWaitMs,
-        onEvent: (e) => {
-            if (e.kind === 'attempt') {
-                // A rejected attempt is a FAILURE and must be visible as one
-                // (phase 2: "failures are shown"), not a quiet info line.
-                log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
-            } else {
-                log.info('pipeline', e.kind);
-            }
-        },
-    });
+    /** @type {object} what bindToMessage() will write for the composer role */
+    let composerRecord = null;
+    let extractionRecord = null;
 
-    if (composed.ok) {
-        note = composed.note;
-        turn.extraction = composed.extraction;
-        turn.composer = composed.composer;
-        turn.pipelineMs = composed.elapsedMs ?? null;
-        lastNote = note;
+    // Phase 3: the popup's "reuse the current one" — no model call, the note
+    // goes in again, and the record SAYS it was reused instead of pretending a
+    // fresh composition happened.
+    const wantsReuse = Boolean(rerollChoice && rerollChoice.token === token
+        && rerollChoice.choice === 'reuse' && lastNote);
+    if (wantsReuse) {
+        note = lastNote;
+        turn.reroll = 'reused the previous note (user choice)';
+        composerRecord = {
+            text: note, model: '(reused from the previous turn)',
+            tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
+        };
+        turn.composer = composerRecord;
+        log.info('reroll', `reusing the current note for token ${token} — no model call`);
     } else {
-        turn.skipReason = composed.reason;
-        turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
-        log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
+        const composed = await runPipeline(collectInput(token), {
+            key: apiKey(),
+            deadlineMs: s.maxWaitMs,
+            onEvent: (e) => {
+                if (e.kind === 'attempt') {
+                    // A rejected attempt is a FAILURE and must be visible as one
+                    // (phase 2: "failures are shown"), not a quiet info line.
+                    log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                } else {
+                    log.info('pipeline', e.kind);
+                }
+            },
+        });
+
+        if (composed.ok) {
+            note = composed.note;
+            extractionRecord = composed.extraction;
+            composerRecord = composed.composer;
+            turn.extraction = composed.extraction;
+            turn.composer = composed.composer;
+            turn.pipelineMs = composed.elapsedMs ?? null;
+            lastNote = note;
+        } else {
+            turn.skipReason = composed.reason;
+            turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
+            log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
+        }
+        // Panel detail (§6): what each role was asked, and every attempt on the
+        // fallback chain with its raw output — failures shown, not hidden.
+        turn.inputs = composed.inputs ?? null;
+        turn.lorebookText = composed.lorebook ?? '';
+        turn.attempts = (composed.attempts ?? []).map((a) => ({
+            model: a.model ?? null,
+            ok: a.ok === true,
+            reason: a.reason ?? null,
+            attemptIndex: a.attemptIndex ?? 0,
+            text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
+        }));
     }
-    // Panel detail (§6): what each role was asked, and every attempt on the
-    // fallback chain with its raw output — failures shown, not hidden.
-    turn.inputs = composed.inputs ?? null;
-    turn.lorebookText = composed.lorebook ?? '';
-    turn.attempts = (composed.attempts ?? []).map((a) => ({
-        model: a.model ?? null,
-        ok: a.ok === true,
-        reason: a.reason ?? null,
-        attemptIndex: a.attemptIndex ?? 0,
-        text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
-    }));
 
     if (!note) {
-        recordSkip(log, SKIP.NO_NOTE, composed.detail ?? composed.reason ?? '', token);
+        recordSkip(log, SKIP.NO_NOTE, turn.failure?.detail ?? turn.failure?.reason ?? '', token);
         injectedTokens.add(token);
         return;
     }
@@ -438,14 +506,14 @@ async function injectInto(payload, shape) {
 
     // Keep the note for the registry route and for binding after the reply lands.
     setPending(note, {
-        noteHash: composed.noteHash,
+        noteHash: noteHash(note),
         position: opts.position,
-        extraction: composed.extraction,
-        composer: composed.composer,
-        model: composed.composer?.model,
-        tokensIn: composed.composer?.tokensIn,
-        tokensOut: composed.composer?.tokensOut,
-        createdAt: composed.composer?.createdAt,
+        extraction: extractionRecord,
+        composer: composerRecord,
+        model: composerRecord?.model,
+        tokensIn: composerRecord?.tokensIn,
+        tokensOut: composerRecord?.tokensOut,
+        createdAt: composerRecord?.createdAt,
     });
 
     // Also register it, so a pre-assembly path and SillyTavern's own machinery
@@ -459,6 +527,49 @@ async function injectInto(payload, shape) {
 
 function roleCode(role) {
     return { system: 0, user: 1, assistant: 2 }[role] ?? 0;
+}
+
+/* ---------------------------------------------------------- record editing */
+
+/**
+ * Phase 3: user edits to a stored record. The LIVE record is mutated (trap 15)
+ * through the edit helpers, which keep the superseded value in `history` (I1)
+ * and — for extractions — flag the dependent composer entry stale (§6).
+ */
+function editRecordField(messageIndex, swipeIndex, field, text) {
+    try {
+        const list = chat();
+        const message = list?.[Number(messageIndex)];
+        if (!message) {
+            return { ok: false, reason: 'message not found' };
+        }
+        const record = readSwipeRecordOrNull(message, Number(swipeIndex));
+        if (!record) {
+            return { ok: false, reason: 'no copilot record on that swipe' };
+        }
+        const res = field === 'composer'
+            ? applyComposerEdit(record, text)
+            : applyExtractionEdit(record, text);
+        if (res.ok) {
+            writeSwipeRecord(message, Number(swipeIndex), {}); // re-mirror the updated root
+            saveChatConditional?.();
+            log.info('edit', `${field} edited on message ${messageIndex} swipe ${swipeIndex}${field === 'extraction' ? ' — composer entry flagged stale' : ''}`);
+        } else {
+            log.warn('edit', `edit refused on message ${messageIndex} swipe ${swipeIndex}: ${res.reason}`);
+        }
+        return { ok: res.ok, reason: res.reason };
+    } catch (err) {
+        log.error('edit', `edit threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
+}
+
+function editNote(messageIndex, swipeIndex, text) {
+    return editRecordField(messageIndex, swipeIndex, 'composer', text);
+}
+
+function editExtraction(messageIndex, swipeIndex, text) {
+    return editRecordField(messageIndex, swipeIndex, 'extraction', text);
 }
 
 function onMessageReceived() {
@@ -545,6 +656,12 @@ function installWatcher() {
     log.info('boot', 'outgoing-request watcher installed (GOAL.md 10.8)');
 }
 
+function escapeHtml(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function installPanel() {
     const panelId = 'copilot-debug';
     if (document.getElementById(panelId)) {
@@ -561,19 +678,80 @@ function installPanel() {
             <button type="button" data-act="clear">Clear</button>
             <button type="button" data-act="toggle">Toggle</button>
         </div>
-        <pre class="copilot-body"></pre>`;
+        <pre class="copilot-body"></pre>
+        <div class="copilot-records"></div>`;
     document.body.appendChild(panel);
 
     const body = panel.querySelector('.copilot-body');
     const render = () => {
         body.textContent = log.toText({ maxPerLine: 400 });
     };
+
+    // ---- The log browser (phase 3, §6): every record in the chat, one card
+    // layout repeated per message/swipe, each entry editable. Editing keeps the
+    // old value (I1) and an extraction edit flags its composer entry stale.
+    const recordsEl = panel.querySelector('.copilot-records');
+    const renderRecords = () => {
+        try {
+            const entries = listRecords(ctx().chat ?? []);
+            if (entries.length === 0) {
+                recordsEl.innerHTML = '<div class="copilot-record-empty">no copilot records in this chat yet</div>';
+                return;
+            }
+            const last = entries.length - 1;
+            recordsEl.innerHTML = entries.map((e, i) => {
+                const rec = e.record;
+                const stale = rec.composer?.staleFlag === true;
+                return `
+                <div class="copilot-record" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
+                    <div class="copilot-record-head">
+                        <strong>message ${e.messageIndex} · swipe ${e.swipeIndex}</strong>
+                        ${i === last ? '<em class="copilot-badge copilot-badge-latest">last injected note</em>' : ''}
+                        ${e.isCurrentSwipe ? '<em class="copilot-badge">current swipe</em>' : ''}
+                        ${rec.composer?.edited ? '<em class="copilot-badge">note edited</em>' : ''}
+                        ${rec.extraction?.edited ? '<em class="copilot-badge">extraction edited</em>' : ''}
+                        ${stale ? `<em class="copilot-warn">⚠ ${escapeHtml(rec.composer.staleReason ?? 'extraction changed, may not match')}</em>` : ''}
+                    </div>
+                    <label>extraction</label>
+                    <textarea data-field="extraction" rows="3">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
+                    <button type="button" data-act="save-extraction">Save extraction</button>
+                    <label>composer note</label>
+                    <textarea data-field="composer" rows="3">${escapeHtml(rec.composer?.text ?? '')}</textarea>
+                    <button type="button" data-act="save-note">Save note</button>
+                </div>`;
+            }).join('');
+        } catch (err) {
+            recordsEl.textContent = `records unavailable: ${redact(String((err && err.message) || err))}`;
+        }
+    };
+
+    recordsEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act]');
+        if (!btn) {
+            return;
+        }
+        const card = btn.closest('.copilot-record');
+        if (!card) {
+            return;
+        }
+        const mi = Number(card.dataset.mi);
+        const si = Number(card.dataset.si);
+        const isNote = btn.dataset.act === 'save-note';
+        const field = isNote ? 'composer' : 'extraction';
+        const ta = card.querySelector(`textarea[data-field="${isNote ? 'composer' : 'extraction'}"]`);
+        const res = editRecordField(mi, si, field, ta ? ta.value : '');
+        if (res.ok) {
+            renderRecords();
+            render();
+        }
+    });
+
     panel.querySelector('[data-act="copy"]').addEventListener('click', async () => {
         try {
             await navigator.clipboard.writeText(log.toText({ maxPerLine: 4000 }));
             log.info('panel', 'log copied to the clipboard');
         } catch (err) {
-            log.error('panel', `clipboard blocked: ${redact(String(err?.message ?? err))}`);
+            log.error('panel', `clipboard blocked: ${redact(String((err && err.message) || err))}`);
         }
         render();
     });
@@ -587,8 +765,15 @@ function installPanel() {
         log.info('panel', `copilot ${!s.enabled ? 'enabled' : 'disabled'}`);
         render();
     });
-    log.subscribe(render);
+    log.subscribe(() => {
+        render();
+        // Refresh the browser unless the user is typing in a card.
+        if (!recordsEl.contains(document.activeElement)) {
+            renderRecords();
+        }
+    });
     render();
+    renderRecords();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 
@@ -618,7 +803,10 @@ function init() {
 
     // Exposed for the T3 driver and for the user in the console. Never holds a
     // secret: apiKey() is a function, not a value.
-    window.copilot = { log, settings, saveSettings, BUILD_ID, runs: [] };
+    window.copilot = {
+        log, settings, saveSettings, BUILD_ID, runs: [],
+        editNote, editExtraction,
+    };
 
     log.info('boot', `copilot wired up — build ${BUILD_ID}`);
 }

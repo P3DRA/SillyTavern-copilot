@@ -70,3 +70,84 @@
 .copilot-panel.collapsed .copilot-body {
     display: none;
 }
+
+.copilot-panel.collapsed .copilot-records {
+    display: none;
+}
+
+/* ---- The log browser (phase 3): ONE card layout, repeated per message/swipe. */
+.copilot-records {
+    border-top: 1px solid var(--SmartThemeBorderColor, #444);
+    overflow-y: auto;
+    max-height: 24vh;
+    padding: 6px 8px;
+}
+
+.copilot-record {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+    padding: 6px;
+    margin-bottom: 8px;
+}
+
+.copilot-record-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.copilot-badge {
+    font-style: normal;
+    font-size: 10px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.copilot-badge-latest {
+    background: rgba(127, 214, 127, 0.25);
+}
+
+/* §6: "extraction changed, may not match" — visible, not buried. */
+.copilot-warn {
+    color: #ffb86b;
+    font-size: 10px;
+}
+
+.copilot-record label {
+    display: block;
+    margin: 4px 0 2px;
+    opacity: 0.7;
+}
+
+.copilot-record textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 11px;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+}
+
+.copilot-record button {
+    margin-top: 4px;
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 3px;
+}
+
+.copilot-record button:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.copilot-record-empty {
+    opacity: 0.6;
+}
