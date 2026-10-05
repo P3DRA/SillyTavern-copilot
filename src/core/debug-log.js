@@ -21,13 +21,18 @@
  * does not know the UI exists.
  */
 
+import { redact } from './redact.js';
+
 /**
  * Changes on every build of this file. Bump it when shipping a change whose
  * effect you need to be able to confirm from a pasted log.
  */
-export const BUILD_ID = 'copilot-phase1-r4';
+export const BUILD_ID = 'copilot-phase2-r1';
 
 const MAX_EVENTS = 500;
+
+/** Turn records hold request bodies; keep only the most recent ones in memory. */
+const MAX_TURNS = 50;
 
 /** Reasons the note was not injected. Trap 14: exactly one of these per turn. */
 export const SKIP = Object.freeze({
@@ -52,6 +57,7 @@ export class DebugLog {
     constructor(opts = {}) {
         this.buildId = opts.buildId ?? BUILD_ID;
         this.limit = opts.limit ?? MAX_EVENTS;
+        this.maxTurns = opts.maxTurns ?? MAX_TURNS;
         this.now = opts.now ?? (() => Date.now());
         /** @type {Array<{t: number, level: string, kind: string, text: string, data?: unknown}>} */
         this.events = [];
@@ -96,14 +102,23 @@ export class DebugLog {
     /** Start (or reuse) a turn record. @param {string} turnId */
     turn(turnId) {
         if (!this.turns.has(turnId)) {
+            while (this.turns.size >= this.maxTurns) {
+                this.turns.delete(this.turns.keys().next().value);
+            }
             this.turns.set(turnId, {
                 id: turnId,
                 startedAt: this.now(),
+                finishedAt: null,
                 slots: [],
                 extraction: null,
                 composer: null,
                 injection: null,
                 skipReason: null,
+                failure: null,
+                pipelineMs: null,
+                // Script-verified, not self-reported: set from the bytes of the
+                // outgoing request by the fetch watcher (verifyInOutgoing).
+                noteFoundOutgoing: null,
                 incomingPromptSeen: false,
                 outgoingPromptSeen: false,
             });
@@ -117,38 +132,80 @@ export class DebugLog {
     }
 
     /**
-     * The whole log as text, for the "copy" button (GOAL.md §6).
+     * The whole log as text, for the panel and the "copy" button (GOAL.md §6).
      *
-     * Redacted, because a prompt can contain anything the user typed, including
-     * their API key pasted by mistake. Truncated per line, because a pasted log
-     * that is 400KB gets truncated by the messenger instead.
+     * Phase-2 done-when: correct models, token counts, TIMINGS and a
+     * SCRIPT-VERIFIED `injected` flag are shown, failures are shown, and the
+     * copy button gives readable text.
+     *
+     * Redacted on EVERY line, because a prompt can contain anything the user
+     * typed, including their API key pasted by mistake. Truncated per line,
+     * because a pasted log that is 400KB gets truncated by the messenger
+     * instead.
      */
     toText({ maxPerLine = 2000 } = {}) {
         const lines = [];
-        lines.push(`copilot debug log — build ${this.buildId}`);
-        lines.push(`events: ${this.events.length}, turns: ${this.turns.size}`);
+        const push = (s) => lines.push(clip(redact(String(s)), maxPerLine));
+        const failures = this.events.filter((e) => e.level === 'warn' || e.level === 'error').length;
+        push(`copilot debug log — build ${this.buildId}`);
+        push(`events: ${this.events.length}, turns: ${this.turns.size}, failures: ${failures}`);
         lines.push('');
         for (const t of this.turns.values()) {
-            lines.push(`── turn ${t.id} ──`);
-            lines.push(`  incoming prompt seen: ${t.incomingPromptSeen}`);
-            lines.push(`  outgoing request seen: ${t.outgoingPromptSeen}`);
-            lines.push(`  injection: ${t.injection ?? 'n/a'}`);
+            const totalMs = (t.finishedAt ?? this.now()) - t.startedAt;
+            push(`── turn ${t.id} ──`);
+            push(`  timings: total=${totalMs}ms${t.pipelineMs !== null ? ` pipeline=${t.pipelineMs}ms` : ''}`);
+            push(`  script-verified injected (found in the outgoing request): ${t.noteFoundOutgoing === null ? 'not verified' : t.noteFoundOutgoing}`);
+            push(`  incoming prompt seen: ${t.incomingPromptSeen}`);
+            push(`  outgoing request seen: ${t.outgoingPromptSeen}`);
+            push(`  injection: ${t.injection ?? 'n/a'}`);
             if (t.skipReason) {
-                lines.push(`  SKIPPED: ${t.skipReason}`);
+                push(`  FAILURES: SKIPPED: ${t.skipReason}`);
+            }
+            if (t.failure) {
+                push(`  FAILURES: ${t.failure.reason ?? 'unknown'}${t.failure.detail ? ` — ${t.failure.detail}` : ''}`);
             }
             if (t.extraction) {
-                lines.push(`  extraction: model=${t.extraction.model} tokens=${t.extraction.tokensIn}/${t.extraction.tokensOut}`);
-                lines.push(`    ${clip(t.extraction.text, maxPerLine)}`);
+                push(`  extraction: model=${t.extraction.model} tokensIn=${t.extraction.tokensIn} tokensOut=${t.extraction.tokensOut}${stamp(t.extraction.createdAt)}`);
+                push('    input:');
+                for (const line of markedInput(t, 'extractor')) {
+                    push(line);
+                }
+                push('    output:');
+                push(`      ${t.extraction.text}`);
             }
             if (t.composer) {
-                lines.push(`  composer: model=${t.composer.model} tokens=${t.composer.tokensIn}/${t.composer.tokensOut}`);
-                lines.push(`    ${clip(t.composer.text, maxPerLine)}`);
+                push(`  composer: model=${t.composer.model} tokensIn=${t.composer.tokensIn} tokensOut=${t.composer.tokensOut}${stamp(t.composer.createdAt)}`);
+                push('    input:');
+                for (const line of markedInput(t, 'composer')) {
+                    push(line);
+                }
+                push('    output:');
+                push(`      ${t.composer.text}`);
+            }
+            if (Array.isArray(t.attempts) && t.attempts.length > 0) {
+                push('  attempts (the fallback chain, in order):');
+                for (const a of t.attempts) {
+                    push(`    ${a.model ?? '?'} attempt ${(a.attemptIndex ?? 0) + 1}: ${a.ok ? 'ok' : `REJECTED (${a.reason ?? 'unknown'})`}`);
+                    if (!a.ok && a.text) {
+                        push(`      raw: ${a.text}`);
+                    }
+                }
             }
             lines.push('');
         }
-        lines.push('── events ──');
+        push('── failures ──');
+        const failureEvents = this.events.filter((e) => e.level === 'warn' || e.level === 'error');
+        if (failureEvents.length === 0) {
+            push('  (none)');
+        } else {
+            for (const e of failureEvents) {
+                push(`${new Date(e.t).toISOString()} [${e.level}] ${e.kind}: ${e.text}`);
+            }
+        }
+        lines.push('');
+        push('── events ──');
         for (const e of this.events) {
-            lines.push(`${new Date(e.t).toISOString()} [${e.level}] ${e.kind}: ${clip(e.text, maxPerLine)}`);
+            push(`${new Date(e.t).toISOString()} [${e.level}] ${e.kind}: ${e.text}`);
         }
         return lines.join('\n');
     }
@@ -157,6 +214,28 @@ export class DebugLog {
 function clip(text, max) {
     const s = String(text ?? '');
     return s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars]` : s;
+}
+
+function stamp(ms) {
+    return Number.isFinite(ms) ? ` at ${new Date(ms).toISOString()}` : '';
+}
+
+/**
+ * The input sent to one role, one line per line, with `(i)` on the lines that
+ * came from the lorebook (GOAL.md §6: "(i) marker on parts that came from
+ * lorebook/world info etc."). The markers exist ONLY in this display — the
+ * model never sees them.
+ */
+function markedInput(turn, role) {
+    const text = turn.inputs?.[role];
+    if (typeof text !== 'string' || text === '') {
+        return ['      (not recorded)'];
+    }
+    const lore = new Set(String(turn.lorebookText ?? '').split('\n').map((l) => l.trim()).filter(Boolean));
+    return text.split('\n').map((line) => {
+        const trimmed = line.trim();
+        return trimmed !== '' && lore.has(trimmed) ? `      (i) ${line}` : `      ${line}`;
+    });
 }
 
 /**

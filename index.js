@@ -387,7 +387,9 @@ async function injectInto(payload, shape) {
         deadlineMs: s.maxWaitMs,
         onEvent: (e) => {
             if (e.kind === 'attempt') {
-                log.info('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                // A rejected attempt is a FAILURE and must be visible as one
+                // (phase 2: "failures are shown"), not a quiet info line.
+                log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
             } else {
                 log.info('pipeline', e.kind);
             }
@@ -398,11 +400,24 @@ async function injectInto(payload, shape) {
         note = composed.note;
         turn.extraction = composed.extraction;
         turn.composer = composed.composer;
+        turn.pipelineMs = composed.elapsedMs ?? null;
         lastNote = note;
     } else {
         turn.skipReason = composed.reason;
+        turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
         log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
     }
+    // Panel detail (§6): what each role was asked, and every attempt on the
+    // fallback chain with its raw output — failures shown, not hidden.
+    turn.inputs = composed.inputs ?? null;
+    turn.lorebookText = composed.lorebook ?? '';
+    turn.attempts = (composed.attempts ?? []).map((a) => ({
+        model: a.model ?? null,
+        ok: a.ok === true,
+        reason: a.reason ?? null,
+        attemptIndex: a.attemptIndex ?? 0,
+        text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
+    }));
 
     if (!note) {
         recordSkip(log, SKIP.NO_NOTE, composed.detail ?? composed.reason ?? '', token);
@@ -516,6 +531,7 @@ function installWatcher() {
                 turn.outgoingBody = init.body;
                 const check = verifyInOutgoing(init.body, lastNote ?? '');
                 turn.noteFoundOutgoing = check.found;
+                turn.finishedAt = Date.now();
                 log[check.found ? 'info' : 'warn'](
                     'outgoing',
                     `${url.split('/api/')[1]} — note ${check.found ? 'FOUND' : 'NOT FOUND'} in the real outgoing request`,

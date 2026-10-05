@@ -70,6 +70,11 @@ export async function runPipeline(input, deps = {}) {
         elapsedMs: 0,
         attempts: [],
         skipReason: null,
+        // Exactly what was sent to each role, for the debug panel (§6: input,
+        // token count + full prompt). Kept on the RESULT, never on the schema
+        // records — this is diagnostics, not chat data.
+        inputs: { extractor: '', composer: '' },
+        lorebook: typeof input?.lorebook === 'string' ? input.lorebook : '',
     };
 
     try {
@@ -95,6 +100,7 @@ export async function runPipeline(input, deps = {}) {
             language: language.code ?? 'en',
         });
         onEvent({ kind: 'extract-start', messages: extractWindow.messages.length, dropped: extractWindow.dropped });
+        result.inputs.extractor = `${extractorPrompt.text}\n\n${renderMessages(extractWindow.messages)}`;
 
         const extractResult = await callWithFallback({
             models: settings.extractor?.chain ?? [],
@@ -176,6 +182,7 @@ export async function runPipeline(input, deps = {}) {
             maxWords: String(noteBudget.maxWords),
         });
         onEvent({ kind: 'compose-start', messages: composerWindow.messages.length, dropped: composerWindow.dropped });
+        result.inputs.composer = `${composerPrompt.text}\n\n${renderMessages(composerWindow.messages)}`;
 
         const composeResult = await callWithFallback({
             models: settings.composer?.chain ?? [],
