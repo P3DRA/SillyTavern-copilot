@@ -16,7 +16,7 @@
 
 import { callWithFallback, costUsd } from './provider.js';
 import {
-    render, renderMessages, renderEntries, fitMessages, detectLanguage,
+    render, renderMessages, renderEntries, renderGoalFacts, fitMessages, detectLanguage,
     DEFAULT_EXTRACTOR_PROMPT, DEFAULT_COMPOSER_PROMPT,
 } from './prompts.js';
 import { makeExtraction, makeComposer, makeInjection, noteHash } from '../schema/records.js';
@@ -161,7 +161,6 @@ export async function runPipeline(input, deps = {}) {
 
         // ---- 2. Composer ----
         const composerWindow = fitMessages(input.messages, settings.composer?.maxChars ?? 8000);
-        const entries = (Array.isArray(input.goals) ? input.goals : []).map((g) => ({ text: g.text, source: g.turnsElapsed }));
         const noteBudget = {
             minWords: settings.composer?.minWords ?? LIMITS.MIN_WORDS,
             maxWords: settings.composer?.maxWords ?? LIMITS.MAX_WORDS,
@@ -173,7 +172,7 @@ export async function runPipeline(input, deps = {}) {
             characterCard: input.characterCard ?? '',
             narratorPrompt: input.narratorPrompt ?? '',
             userRequest: input.userRequest ?? '',
-            goals: renderEntries(entries),
+            goals: renderGoalFacts(input.goals ?? []),
             // TRAP 9: without the previous note the composer regenerates the same
             // text every turn and the note becomes wallpaper.
             previousNote: input.previousNote ?? '(none yet — this is the first note in this chat)',

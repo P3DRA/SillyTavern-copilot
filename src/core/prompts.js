@@ -345,6 +345,27 @@ export function renderEntries(entries) {
 }
 
 /**
+ * Goal facts for the composer prompt (§6 / S6): the SCRIPT-TRACKED counters as
+ * plain prose — "introduce Bob (6 turns elapsed, 2 remaining)". The model is
+ * TOLD the numbers; it is never asked to do arithmetic (GOAL.md §5).
+ */
+export function renderGoalFacts(facts) {
+    if (!Array.isArray(facts)) {
+        return '';
+    }
+    const usable = facts.filter((f) => f && typeof f.text === 'string' && f.text.trim() !== '' && f.complete !== true);
+    if (usable.length === 0) {
+        return '';
+    }
+    return usable
+        .map((f) => {
+            const remaining = f.turnsRemaining === 'forever' ? 'no expiry' : `${f.turnsRemaining} turns remaining`;
+            return `- ${f.text.trim()} (${f.turnsElapsed} turns elapsed, ${remaining})`;
+        })
+        .join('\n');
+}
+
+/**
  * Detect the language of the recent chat, so the note can follow it (S10).
  *
  * Deliberately a coarse script/heuristic pass, not a language identifier: the

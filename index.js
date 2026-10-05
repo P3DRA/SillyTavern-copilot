@@ -29,7 +29,9 @@ import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log
 import { runPipeline } from './src/core/pipeline.js';
 import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord } from './src/schema/store.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
-import { noteHash } from './src/schema/records.js';
+import {
+    noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
+} from './src/schema/records.js';
 import { redact } from './src/core/redact.js';
 import {
     ctx, chat, eventSource, saveChatConditional,
@@ -78,6 +80,9 @@ const DEFAULTS = {
     // proceeds. 'new' / 'reuse' skip the popup (useful for tests and for users
     // who always want the same behaviour).
     rerollMode: 'ask',
+    // Phase 4 (§6): after a reroll composes new data, show the old-vs-new diff
+    // popup (use old / use new / reroll / cancel). Set false for a silent flow.
+    diffPopup: true,
 };
 
 function settings() {
@@ -172,10 +177,9 @@ function collectInput(turnId) {
         characterCard: ctx().name2 ?? '',
         narratorPrompt: ctx().systemPrompt ?? '',
         userRequest: activeRequestText(meta),
-        goals: (meta.goals ?? []).filter((g) => !g.complete).map((g) => ({
-            text: g.text,
-            turnsElapsed: Object.values(g.turnCounters ?? {}).reduce((a, b) => a + (Number(b) || 0), 0),
-        })),
+        // Script-tracked goal FACTS (S6): the counters are computed here, never
+        // by the model. goalFacts drops completed goals.
+        goals: goalFacts(meta.goals ?? [], GOAL_COUNTER_KEY),
         previousNote: previousNoteFor(list),
         settings: settings(),
     };
@@ -217,11 +221,104 @@ function previousNoteFor(list) {
     return '';
 }
 
+/**
+ * Counter namespace for goal turn counts (records.js turnCounters keys).
+ * Goals live in `chat_metadata.copilot` — already per-chat — so one key is
+ * enough; the per-chat key contract stays available for imports (S6).
+ */
+const GOAL_COUNTER_KEY = 'default';
+
 function activeRequestText(meta) {
     return (meta.requests ?? [])
         .filter((r) => !r.complete)
         .map((r) => r.text)
         .join('; ');
+}
+
+/* ------------------------------------------------- goals and user requests */
+
+/**
+ * Script-driven turn counters (S6): advance every goal counter and expire the
+ * user requests whose turn budget is spent — once per REAL narrator turn.
+ *
+ * Trap 1: `chat_metadata` is reassigned by ST on load, so the object is read
+ * FRESH through ctx() and persisted through ST's own saveMetadata. The model
+ * is never asked to do this arithmetic (GOAL.md §5).
+ */
+function tickChatState() {
+    try {
+        const meta = ctx().chatMetadata;
+        if (!meta) {
+            return;
+        }
+        const root = meta.copilot ?? (meta.copilot = {});
+        const beforeGoals = (root.goals ?? []).filter((g) => !g.complete).length;
+        const beforeReq = (root.requests ?? []).filter((r) => !r.complete).length;
+        tickGoals(root.goals ?? [], GOAL_COUNTER_KEY);
+        tickRequests(root.requests ?? []);
+        const afterGoals = (root.goals ?? []).filter((g) => !g.complete).length;
+        const afterReq = (root.requests ?? []).filter((r) => !r.complete).length;
+        saveMetadata();
+        if (afterGoals !== beforeGoals || afterReq !== beforeReq) {
+            log.info('goals', `tick: ${beforeGoals} goals / ${beforeReq} requests active -> ${afterGoals} / ${afterReq} (completed or expired)`);
+        }
+    } catch (err) {
+        log.warn('goals', `tick failed: ${redact(String((err && err.message) || err))}`);
+    }
+}
+
+/** Read-modify-write chat_metadata.copilot through a fresh ctx() (trap 1). */
+function withMeta(fn) {
+    const meta = ctx().chatMetadata;
+    if (!meta) {
+        return { ok: false, reason: 'no chat metadata' };
+    }
+    const root = meta.copilot ?? (meta.copilot = {});
+    const res = fn(root) ?? { ok: true, reason: null };
+    saveMetadata();
+    return res;
+}
+
+function addGoal(text, remainingTurns = 'forever') {
+    return withMeta((root) => {
+        const goal = makeGoal({ text, remainingTurns });
+        root.goals = [...(root.goals ?? []), goal];
+        log.info('goals', `goal added: "${goal.text}" (${goal.remainingTurns === 'forever' ? 'no expiry' : `${goal.remainingTurns} turns`})`);
+        return { ok: true, reason: null, id: goal.id };
+    });
+}
+
+function completeGoal(id) {
+    return withMeta((root) => {
+        const goal = (root.goals ?? []).find((g) => g.id === id);
+        if (!goal) {
+            return { ok: false, reason: 'goal not found' };
+        }
+        goal.complete = true;
+        log.info('goals', `goal completed: "${goal.text}"`);
+        return { ok: true, reason: null };
+    });
+}
+
+function addRequest(text, remainingTurns = 'forever') {
+    return withMeta((root) => {
+        const req = makeUserRequest({ text, remainingTurns });
+        root.requests = [...(root.requests ?? []), req];
+        log.info('goals', `request added: "${req.text}" (${req.remainingTurns === 'forever' ? 'forever' : `${req.remainingTurns} turns`})`);
+        return { ok: true, reason: null, id: req.id };
+    });
+}
+
+function removeRequest(id) {
+    return withMeta((root) => {
+        const before = (root.requests ?? []).length;
+        root.requests = (root.requests ?? []).filter((r) => r.id !== id);
+        if (root.requests.length === before) {
+            return { ok: false, reason: 'request not found' };
+        }
+        log.info('goals', 'request removed');
+        return { ok: true, reason: null };
+    });
 }
 
 /* ---------------------------------------------------------------- injection */
@@ -303,6 +400,51 @@ async function askRerollChoice() {
     }
 }
 
+/**
+ * The diff popup (§6): old vs new extraction + composer, with the options
+ * use old / use new / reroll / cancel. Awaited inside the prompt-ready hook,
+ * so the outgoing request waits for the answer exactly like the reroll popup.
+ */
+async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
+    try {
+        const call = ctx().callGenericPopup;
+        const POPUP_TYPE = ctx().POPUP_TYPE;
+        if (!call || !POPUP_TYPE) {
+            log.warn('reroll', 'no popup API in the ST context — defaulting to the new note');
+            return 'new';
+        }
+        const block = (label, text) => `<div class="copilot-diff-block"><strong>${escapeHtml(label)}</strong><pre>${escapeHtml(String(text ?? '(none)'))}</pre></div>`;
+        const html = `<div class="copilot-diff">
+            <p>The reroll composed new copilot data. Which should be used?</p>
+            ${block('OLD extraction', oldExtraction)}
+            ${block('NEW extraction', newExtraction)}
+            ${block('OLD note', oldNote)}
+            ${block('NEW note', newNote)}
+        </div>`;
+        const result = await call(html, POPUP_TYPE.CONFIRM, null, {
+            okButton: 'Use the NEW note',
+            cancelButton: 'Use the OLD note',
+            customButtons: [
+                { text: 'Reroll (compose again)', result: 1001 },
+                { text: 'Cancel (no note)', result: 1002 },
+            ],
+        });
+        if (result === 1) {
+            return 'new';
+        }
+        if (result === 1001) {
+            return 'reroll';
+        }
+        if (result === 1002) {
+            return 'cancel';
+        }
+        return 'old';
+    } catch (err) {
+        log.warn('reroll', `diff popup failed — defaulting to the new note: ${redact(String(err?.message ?? err))}`);
+        return 'new';
+    }
+}
+
 async function onGenerationStarted(type, opts = {}, dryRun = false) {
     // Trap 14: every decline logs exactly one line. A dry run, a quiet
     // generation and an impersonation are NOT turns of the narrator and must
@@ -334,6 +476,9 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
         log.warn('generation', `no API key configured — ${SKIP.NO_KEY}`);
         return;
     }
+    // Phase 4 (S6): the goal counters and request expiries advance here — once
+    // per real narrator turn, by script, before composition reads them.
+    tickChatState();
     // Phase 3: swipe and reroll ask first. Everything else composes as usual.
     if (type === 'swipe' || type === 'regenerate') {
         const mode = s.rerollMode ?? 'ask';
@@ -447,21 +592,45 @@ async function injectInto(payload, shape) {
         turn.composer = composerRecord;
         log.info('reroll', `reusing the current note for token ${token} — no model call`);
     } else {
-        const composed = await runPipeline(collectInput(token), {
-            key: apiKey(),
-            deadlineMs: s.maxWaitMs,
-            onEvent: (e) => {
-                if (e.kind === 'attempt') {
-                    // A rejected attempt is a FAILURE and must be visible as one
-                    // (phase 2: "failures are shown"), not a quiet info line.
-                    log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
-                } else {
-                    log.info('pipeline', e.kind);
-                }
-            },
-        });
+        const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
+        const oldNote = lastNote ?? '';
+        let input = collectInput(token);
+        const oldExtraction = (input.extractions ?? []).at(-1)?.text ?? '';
+        let rerolls = 0;
+        for (;;) {
+            const composed = await runPipeline(input, {
+                key: apiKey(),
+                deadlineMs: s.maxWaitMs,
+                onEvent: (e) => {
+                    if (e.kind === 'attempt') {
+                        // A rejected attempt is a FAILURE and must be visible as one
+                        // (phase 2: "failures are shown"), not a quiet info line.
+                        log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                    } else {
+                        log.info('pipeline', e.kind);
+                    }
+                },
+            });
 
-        if (composed.ok) {
+            // Panel detail (§6): what each role was asked, and every attempt on
+            // the fallback chain with its raw output — failures shown, not hidden.
+            turn.inputs = composed.inputs ?? null;
+            turn.lorebookText = composed.lorebook ?? '';
+            turn.attempts = (composed.attempts ?? []).map((a) => ({
+                model: a.model ?? null,
+                ok: a.ok === true,
+                reason: a.reason ?? null,
+                attemptIndex: a.attemptIndex ?? 0,
+                text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
+            }));
+
+            if (!composed.ok) {
+                turn.skipReason = composed.reason;
+                turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
+                log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
+                break;
+            }
+
             note = composed.note;
             extractionRecord = composed.extraction;
             composerRecord = composed.composer;
@@ -469,22 +638,43 @@ async function injectInto(payload, shape) {
             turn.composer = composed.composer;
             turn.pipelineMs = composed.elapsedMs ?? null;
             lastNote = note;
-        } else {
-            turn.skipReason = composed.reason;
-            turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
-            log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
+
+            // Phase 4 (§6): the diff popup on rerolls — old vs new extraction
+            // and note, four options. Only when there IS an old note to diff
+            // against and this is a swipe/reroll turn.
+            if (!(s.diffPopup !== false && isRerollTurn && oldNote)) {
+                break;
+            }
+            const choice = await askDiffChoice(oldExtraction, composed.extraction?.text ?? '', oldNote, composed.note);
+            log.info('reroll', `diff popup answered: ${choice}`);
+            turn.reroll = `${turn.reroll ? `${turn.reroll}; ` : ''}diff popup: ${choice}`;
+            if (choice === 'new') {
+                break;
+            }
+            if (choice === 'old') {
+                note = oldNote;
+                extractionRecord = null;
+                composerRecord = {
+                    text: note, model: '(reused — diff popup: use old)',
+                    tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
+                };
+                turn.composer = composerRecord;
+                turn.extraction = null;
+                break;
+            }
+            if (choice === 'cancel') {
+                recordSkip(log, SKIP.SUPPRESSED, 'diff popup: cancel — no note this turn', token);
+                injectedTokens.add(token);
+                return;
+            }
+            // 'reroll' — compose again from fresh input (bounded).
+            rerolls += 1;
+            if (rerolls >= 2) {
+                log.warn('reroll', 'diff popup reroll limit reached — keeping the newest composition');
+                break;
+            }
+            input = collectInput(token);
         }
-        // Panel detail (§6): what each role was asked, and every attempt on the
-        // fallback chain with its raw output — failures shown, not hidden.
-        turn.inputs = composed.inputs ?? null;
-        turn.lorebookText = composed.lorebook ?? '';
-        turn.attempts = (composed.attempts ?? []).map((a) => ({
-            model: a.model ?? null,
-            ok: a.ok === true,
-            reason: a.reason ?? null,
-            attemptIndex: a.attemptIndex ?? 0,
-            text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
-        }));
     }
 
     if (!note) {
@@ -667,25 +857,119 @@ function installPanel() {
     if (document.getElementById(panelId)) {
         return;
     }
+    // ST's own presentation for extension settings: an inline-drawer accordion
+    // INSIDE the Extensions drawer (index.html:5760 `#extensions_settings` /
+    // :5778 `#extensions_settings2`). The first draft was a floating overlay
+    // over the chat — wrong home for it (user report).
     const panel = document.createElement('div');
     panel.id = panelId;
-    panel.className = 'copilot-panel';
+    panel.className = 'extension_container copilot-panel';
     panel.innerHTML = `
-        <div class="copilot-head">
-            <strong>Copilot</strong>
-            <code class="copilot-build">build ${BUILD_ID}</code>
-            <button type="button" data-act="copy">Copy log</button>
-            <button type="button" data-act="clear">Clear</button>
-            <button type="button" data-act="toggle">Toggle</button>
-        </div>
-        <pre class="copilot-body"></pre>
-        <div class="copilot-records"></div>`;
-    document.body.appendChild(panel);
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>Copilot</b>
+                <code class="copilot-build">build ${BUILD_ID}</code>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content" style="display: none;">
+                <div class="copilot-head">
+                    <button type="button" data-act="copy">Copy log</button>
+                    <button type="button" data-act="clear">Clear</button>
+                    <button type="button" data-act="toggle">Toggle</button>
+                </div>
+                <pre class="copilot-body"></pre>
+                <div class="copilot-goals"></div>
+                <div class="copilot-records"></div>
+            </div>
+        </div>`;
+    const host = document.getElementById('extensions_settings2')
+        || document.getElementById('extensions_settings')
+        || document.body;
+    host.appendChild(panel);
+
+    // The accordion collapse, through ST's own helper (utils.js toggleDrawer).
+    const drawer = panel.querySelector('.inline-drawer');
+    panel.querySelector('.inline-drawer-toggle').addEventListener('click', async () => {
+        try {
+            const utils = await import('/scripts/utils.js');
+            const expanded = drawer.querySelector('.inline-drawer-content').style.display !== 'none';
+            utils.toggleDrawer(drawer, !expanded);
+        } catch (err) {
+            log.warn('panel', `drawer toggle failed: ${redact(String((err && err.message) || err))}`);
+        }
+    });
 
     const body = panel.querySelector('.copilot-body');
     const render = () => {
         body.textContent = log.toText({ maxPerLine: 400 });
     };
+
+    // ---- Goals and user requests (phase 4, §6 / S6). The counters shown here
+    // are the SCRIPT-tracked facts the composer receives — the model is never
+    // asked to do the arithmetic.
+    const goalsEl = panel.querySelector('.copilot-goals');
+    const renderGoals = () => {
+        try {
+            const meta = ctx().chatMetadata?.copilot ?? {};
+            const goals = meta.goals ?? [];
+            const requests = meta.requests ?? [];
+            goalsEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>goals &amp; requests</strong></div>
+                <div class="copilot-gr-add">
+                    <input type="text" data-gr="goal-text" placeholder="goal (e.g. introduce Bob)" />
+                    <input type="text" data-gr="goal-turns" placeholder="turns (blank = forever)" size="12" />
+                    <button type="button" data-act="add-goal">Add goal</button>
+                </div>
+                <div class="copilot-gr-add">
+                    <input type="text" data-gr="req-text" placeholder="request (e.g. nudge toward the storm)" />
+                    <input type="text" data-gr="req-turns" placeholder="turns (blank = forever)" size="12" />
+                    <button type="button" data-act="add-request">Add request</button>
+                </div>
+                ${goals.map((g) => {
+                    const elapsed = Object.values(g.turnCounters ?? {}).reduce((a, b) => a + (Number(b) || 0), 0);
+                    const remaining = g.remainingTurns === 'forever' ? 'no expiry' : `${Math.max(0, g.remainingTurns - elapsed)} left`;
+                    return `<div class="copilot-gr-item${g.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(g.id)}">
+                        <span>${escapeHtml(g.text)} — ${elapsed} turns elapsed, ${remaining}${g.complete ? ' (complete)' : ''}</span>
+                        ${g.complete ? '' : '<button type="button" data-act="done-goal">Done</button>'}
+                    </div>`;
+                }).join('')}
+                ${requests.map((r) => {
+                    const remaining = r.remainingTurns === 'forever' ? 'forever' : `${Math.max(0, r.remainingTurns - (Number(r.turnsElapsed) || 0))} left`;
+                    return `<div class="copilot-gr-item${r.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(r.id)}">
+                        <span>${escapeHtml(r.text)} — ${remaining}${r.complete ? ' (expired)' : ''}</span>
+                        <button type="button" data-act="remove-request">Remove</button>
+                    </div>`;
+                }).join('')}`;
+        } catch (err) {
+            goalsEl.textContent = `goals unavailable: ${redact(String((err && err.message) || err))}`;
+        }
+    };
+    goalsEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act]');
+        if (!btn) {
+            return;
+        }
+        const item = btn.closest('.copilot-gr-item');
+        const id = item ? item.dataset.id : null;
+        const val = (name) => goalsEl.querySelector(`[data-gr="${name}"]`)?.value ?? '';
+        const turns = (raw) => (String(raw).trim() === '' ? 'forever' : Number(raw));
+        if (btn.dataset.act === 'add-goal') {
+            const text = val('goal-text').trim();
+            if (text) {
+                addGoal(text, turns(val('goal-turns')));
+            }
+        } else if (btn.dataset.act === 'add-request') {
+            const text = val('req-text').trim();
+            if (text) {
+                addRequest(text, turns(val('req-turns')));
+            }
+        } else if (btn.dataset.act === 'done-goal' && id) {
+            completeGoal(id);
+        } else if (btn.dataset.act === 'remove-request' && id) {
+            removeRequest(id);
+        }
+        renderGoals();
+    });
 
     // ---- The log browser (phase 3, §6): every record in the chat, one card
     // layout repeated per message/swipe, each entry editable. Editing keeps the
@@ -767,13 +1051,15 @@ function installPanel() {
     });
     log.subscribe(() => {
         render();
-        // Refresh the browser unless the user is typing in a card.
-        if (!recordsEl.contains(document.activeElement)) {
+        // Refresh the browser/goals unless the user is typing in them.
+        if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)) {
             renderRecords();
+            renderGoals();
         }
     });
     render();
     renderRecords();
+    renderGoals();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 
@@ -806,6 +1092,7 @@ function init() {
     window.copilot = {
         log, settings, saveSettings, BUILD_ID, runs: [],
         editNote, editExtraction,
+        addGoal, completeGoal, addRequest, removeRequest, tick: tickChatState,
     };
 
     log.info('boot', `copilot wired up — build ${BUILD_ID}`);

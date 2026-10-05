@@ -361,6 +361,9 @@ export function tickGoals(goals, now = 'default') {
  * @property {number} createdAt
  * @property {boolean} complete
  * @property {string} [scope] Free-text hint (e.g. 'scene', 'tone') — added for the UI.
+ * @property {number} [turnsElapsed] // ADDED (phase 4): script-driven expiry
+ *   counter. S6 requires requests to expire after N turns; turns, not wall
+ *   time, are the unit, so something must count them.
  */
 
 /**
@@ -374,8 +377,31 @@ export function makeUserRequest(init = {}) {
         remainingTurns: init.remainingTurns === 'forever' ? 'forever' : Math.max(0, Number(init.remainingTurns) || 0),
         createdAt: Number(init.createdAt) || Date.now(),
         complete: init.complete === true,
+        turnsElapsed: Math.max(0, Number(init.turnsElapsed) || 0),
         ...(isNonEmptyString(init.scope) ? { scope: init.scope } : {}),
     };
+}
+
+/**
+ * Advance every request by one narrator turn and expire the ones whose budget
+ * is spent (S6). Mutates and returns the same array so callers persist in
+ * place.
+ * @param {UserRequest[]} requests
+ */
+export function tickRequests(requests) {
+    if (!Array.isArray(requests)) {
+        return [];
+    }
+    for (const r of requests) {
+        if (!r || r.complete) {
+            continue;
+        }
+        r.turnsElapsed = (Number(r.turnsElapsed) || 0) + 1;
+        if (r.remainingTurns !== 'forever' && r.turnsElapsed >= r.remainingTurns) {
+            r.complete = true;
+        }
+    }
+    return requests;
 }
 
 /* --------------------------------------------------------------- snapshots */
