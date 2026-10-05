@@ -1,28 +1,46 @@
 /**
  * Where copilot data physically lives, and how it is read and written safely.
  *
- * PLACEMENT (GOAL.md §5): per-swipe, with the swipe, in the message's extra data.
+ * PLACEMENT (GOAL.md §5, slot verified in §7):
+ * copilot data is stored per swipe, with the swipe, in the message's per-swipe
+ * extra data. That slot is `swipe_info[i].extra`:
  *
  *     message N
- *     └── extra.copilot = { version, swipes: [ SwipeRecord, … ] }
- *                                      ▲ index-aligned with message.swipes
+ *     ├── swipes[i]                 ← SillyTavern: the text of swipe i
+ *     ├── swipe_id                  ← SillyTavern: which swipe is current
+ *     ├── swipe_info[i].extra       ← SillyTavern: PER-SWIPE extra  (ours lives here)
+ *     │   └── copilot               ← OURS, authoritative
+ *     └── extra                     ← SillyTavern: MIRROR of swipe_info[swipe_id].extra
+ *         └── copilot               ← ours, kept in step so ST's own sync is harmless
  *
- * Why a parallel array indexed by swipe index:
- *   - `message.swipes[i]` is the text of swipe i and `message.swipe_id` is the
- *     current one. Both are first-class in ST and both are persisted.
- *   - The array only ever grows by appending (swipe) and shrinks only when the
- *     whole message is deleted. It never reorders, so index alignment holds.
- *   - If it ever does not hold, `readSwipeRecord` returns an empty record
- *     ("no data"), which is I6's required degradation — never a throw.
+ * Why `swipe_info[i].extra` and NOT a sibling array under `message.extra`:
  *
- * Crucially this removes the entire bug class that killed the previous build:
- * there is no separate "slot" counter, no version counter, and no turn/slot
- * arithmetic to get wrong. The note for a generation is stored in the very
- * record that will hold that generation's text. One writer, one source of
- * truth (GOAL.md §12 trap 15).
+ * `message.extra` is not a stable container. SillyTavern treats it as a mirror
+ * of the current swipe's extra and replaces it wholesale, by deep clone, on
+ * every swipe navigation:
  *
- * Pure module: takes a message object, mutates that object, calls an injected
- * `markDirty`. No ST imports, so all of it is unit-testable in Node.
+ *     public/script.js:6956   targetMessage.extra = structuredClone(targetSwipeInfo?.extra) ?? {};
+ *
+ * A sibling array such as `message.extra.copilot.swipes[i]` therefore lives
+ * *inside the object that gets thrown away* and would vanish the first time the
+ * user swiped — silently, and with no error anywhere. The per-swipe slot that
+ * actually survives is `swipe_info[i].extra`, and ST maintains the mirror for us
+ * in both directions (`syncMesToSwipe` pushes `message.extra` down at
+ * script.js:6880; `syncSwipeToMes` pulls it back at script.js:6956).
+ *
+ * THE TWO HARD RULES THAT FOLLOW
+ *
+ * 1. NEVER cache a reference to `message.extra` (or to any object under it).
+ *    Every sync replaces it with a fresh clone, so a held reference is detached
+ *    and writes to it vanish. Always reach through `message` fresh.
+ *
+ * 2. Write the authoritative copy to `swipe_info[i].extra.copilot`, and mirror
+ *    it into `message.extra.copilot` only when `i === message.swipe_id`.
+ *    Then ST's own push copies the same data back onto the same slot, so the
+ *    round trip is a no-op instead of a clobber.
+ *
+ * Pure module: takes a message object, mutates that object, no ST imports, so
+ * every rule above is unit-testable in Node.
  */
 
 import {
@@ -31,120 +49,177 @@ import {
 
 export const ROOT_KEY = 'copilot';
 
-/** Never mutate a frozen/non-object message. */
 function isPlainObject(v) {
     return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 }
 
 /**
- * The per-message container, created on demand.
- * Never throws: a frozen or exotic message yields a detached empty state that
- * the caller can use as a scratch record (I6).
+ * Read (without creating) the copilot root for one swipe.
  * @param {object} message
- * @returns {{version: number, swipes: object[]}}
+ * @param {number} swipeIndex
+ * @returns {{version: number}|null} null when there is no data for that swipe.
  */
-export function getMessageState(message) {
-    const empty = { version: SCHEMA_VERSION, swipes: [] };
+export function peekSwipeRoot(message, swipeIndex) {
+    if (!isPlainObject(message) || !Number.isInteger(swipeIndex) || swipeIndex < 0) {
+        return null;
+    }
+    const extra = message.swipe_info?.[swipeIndex]?.extra;
+    if (!isPlainObject(extra)) {
+        return null;
+    }
+    const root = extra[ROOT_KEY];
+    return isPlainObject(root) ? root : null;
+}
+
+/**
+ * Create and return the copilot root for one swipe, creating `swipe_info` and the
+ * enclosing `extra` bag as needed. Never throws (I6, trap 11).
+ *
+ * @param {object} message
+ * @param {number} swipeIndex
+ * @returns {{version: number, record: import('./records.js').SwipeRecord}}
+ */
+function ensureSwipeRoot(message, swipeIndex) {
+    const detached = { version: SCHEMA_VERSION, record: emptySwipeRecord() };
+    if (!isPlainObject(message) || !Object.isExtensible(message) || !Number.isInteger(swipeIndex) || swipeIndex < 0) {
+        return detached;
+    }
+    try {
+        if (!Array.isArray(message.swipe_info)) {
+            // Backfill the way ST's own `ensureSwipes` would (script.js:6809-6812),
+            // one entry per existing swipe, so indices line up with `swipes`.
+            const swipeCount = Array.isArray(message.swipes) ? message.swipes.length : 0;
+            message.swipe_info = Array.from({ length: Math.max(swipeCount, 1) }, () => ({
+                send_date: message.send_date,
+                gen_started: message.gen_started,
+                gen_finished: message.gen_finished,
+                extra: {},
+            }));
+        }
+        while (message.swipe_info.length <= swipeIndex) {
+            message.swipe_info.push({ send_date: message.send_date, extra: {} });
+        }
+        const info = message.swipe_info[swipeIndex];
+        if (!isPlainObject(info)) {
+            message.swipe_info[swipeIndex] = { send_date: message.send_date, extra: {} };
+        }
+        if (!isPlainObject(message.swipe_info[swipeIndex].extra)) {
+            message.swipe_info[swipeIndex].extra = {};
+        }
+        const infoExtra = message.swipe_info[swipeIndex].extra;
+        if (!isPlainObject(infoExtra[ROOT_KEY])) {
+            infoExtra[ROOT_KEY] = { version: SCHEMA_VERSION };
+        }
+        const root = infoExtra[ROOT_KEY];
+        if (!Number.isInteger(root.version)) {
+            root.version = SCHEMA_VERSION;
+        }
+        return { version: root.version, record: root };
+    } catch {
+        return detached;
+    }
+}
+
+/** Mirror the current swipe's copilot root onto `message.extra`, where ST expects it. */
+function mirrorToMessageExtra(message, swipeIndex, root) {
     if (!isPlainObject(message) || !Object.isExtensible(message)) {
-        return empty;
+        return;
+    }
+    if (message.swipe_id !== swipeIndex) {
+        // Not the live swipe. Touching message.extra here would publish another
+        // swipe's data as the current one — worse than doing nothing.
+        return;
     }
     try {
         if (!isPlainObject(message.extra)) {
             message.extra = {};
         }
-        const root = message.extra[ROOT_KEY];
-        if (!isPlainObject(root)) {
-            message.extra[ROOT_KEY] = empty;
-            return empty;
-        }
-        if (!Array.isArray(root.swipes)) {
-            root.swipes = [];
-        }
-        if (!Number.isInteger(root.version)) {
-            root.version = SCHEMA_VERSION;
-        }
-        return root;
+        message.extra[ROOT_KEY] = structuredClone(root);
     } catch {
-        // Frozen `extra`, a getter that throws, a Proxy — none of these may
-        // take the narrator's generation down with them (trap 11 / I5).
-        return empty;
+        /* the authoritative copy in swipe_info is what matters */
     }
-}
-
-/** True when this message has any copilot data at all. @param {object} message */
-export function hasCopilotData(message) {
-    if (!isPlainObject(message)) {
-        return false;
-    }
-    const root = message.extra?.[ROOT_KEY];
-    return isPlainObject(root) && Array.isArray(root.swipes) && root.swipes.some((s) => isSwipeRecord(s));
 }
 
 /**
- * Read the record for one swipe. Always returns a usable record.
+ * The SwipeRecord for one swipe, or null when there is none.
+ * The returned object IS the stored object — normalise in place, never copy.
+ * Writing through it therefore persists (GOAL.md §12 trap 15).
  *
- * When the slot holds data, the returned object IS the stored object — normalised
- * in place, not copied. Writing through it therefore persists. Returning a copy
- * here is the exact footgun GOAL.md §12 trap 15 describes: a caller mutates a
- * "read" result, the write vanishes, and two code paths each believe they own
- * the value.
- *
- * When the slot is absent or corrupt, a detached empty record is returned and
- * nothing is written — reading never creates data (I6).
+ * @param {object} message
+ * @param {number} swipeIndex
+ * @returns {import('./records.js').SwipeRecord|null}
+ */
+export function readSwipeRecordOrNull(message, swipeIndex) {
+    const root = peekSwipeRoot(message, swipeIndex);
+    if (!root || !isSwipeRecord(root.record)) {
+        return null;
+    }
+    const normalised = coerceSwipeRecord(root.record);
+    for (const key of Object.keys(root.record)) {
+        if (!(key in normalised)) {
+            delete root.record[key];
+        }
+    }
+    Object.assign(root.record, normalised);
+    return root.record;
+}
+
+/**
+ * Read the record for one swipe. Always returns a usable record; absent or
+ * corrupt data degrades to "no data" (I6). Reading never creates anything.
  *
  * @param {object} message
  * @param {number} swipeIndex
  * @returns {import('./records.js').SwipeRecord}
  */
 export function readSwipeRecord(message, swipeIndex) {
-    if (!Number.isInteger(swipeIndex) || swipeIndex < 0) {
-        return emptySwipeRecord();
+    const live = readSwipeRecordOrNull(message, swipeIndex);
+    return live ?? emptySwipeRecord();
+}
+
+/** True when this message has any copilot data on any swipe. @param {object} message */
+export function hasCopilotData(message) {
+    if (!isPlainObject(message)) {
+        return false;
     }
-    // Peek WITHOUT allocating: a read must not leave `extra.copilot` behind on a
-    // message that never had copilot data, or `hasCopilotData` semantics and the
-    // chat file both acquire phantom keys.
-    const raw = isPlainObject(message) ? message.extra?.[ROOT_KEY]?.swipes?.[swipeIndex] : undefined;
-    if (!isSwipeRecord(raw)) {
-        return emptySwipeRecord();
-    }
-    const normalised = coerceSwipeRecord(raw);
-    // Normalise into the stored object so the caller's reference is the truth.
-    for (const key of Object.keys(raw)) {
-        if (!(key in normalised)) {
-            delete raw[key];
-        }
-    }
-    Object.assign(raw, normalised);
-    return raw;
+    const infos = Array.isArray(message.swipe_info) ? message.swipe_info : [];
+    return infos.some((info) => isSwipeRecord(info?.extra?.[ROOT_KEY]?.record));
 }
 
 /**
- * Create the slot if needed and return it (live reference — mutating it mutates
- * the stored record, which is what callers want during a generation).
+ * Create the slot if needed and return the live record.
+ *
+ * If a record already exists it is returned UNCHANGED. Overwriting it with a
+ * fresh empty record here would silently destroy every extraction and note the
+ * moment anything was written twice — which is I1, the invariant this whole
+ * project exists to keep.
+ *
  * @param {object} message
  * @param {number} swipeIndex
  * @returns {import('./records.js').SwipeRecord}
  */
 export function ensureSwipeRecord(message, swipeIndex) {
-    const state = getMessageState(message);
-    while (state.swipes.length <= swipeIndex) {
-        // Sparse holes would break index alignment with message.swipes.
-        state.swipes.push(null);
+    const root = ensureSwipeRoot(message, swipeIndex);
+    // readSwipeRecordOrNull normalises in place and returns the stored object,
+    // so an existing record is returned live and untouched.
+    const existing = readSwipeRecordOrNull(message, swipeIndex);
+    if (existing) {
+        mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
+        return existing;
     }
-    if (!isSwipeRecord(state.swipes[swipeIndex])) {
-        state.swipes[swipeIndex] = makeSwipeRecord({});
-    } else {
-        state.swipes[swipeIndex] = coerceSwipeRecord(state.swipes[swipeIndex]);
-    }
-    return state.swipes[swipeIndex];
+    const created = makeSwipeRecord({});
+    // `root` is detached when the message is not writable; assigning to it then
+    // is harmless and the caller still gets a usable object.
+    root.record.record = created;
+    mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
+    return created;
 }
 
 /**
- * Write a record into a swipe slot.
+ * Write a patch into a swipe slot.
  *
- * I1/I8: this never removes data. Writing an "empty" record replaces only the
- * fields it carries; fields it omits are preserved. To clear a field, clear it
- * in the record object first.
+ * I1/I8: this never removes data it does not carry. Fields absent from the patch
+ * keep their current value.
  *
  * @param {object} message
  * @param {number} swipeIndex
@@ -152,21 +227,24 @@ export function ensureSwipeRecord(message, swipeIndex) {
  * @returns {import('./records.js').SwipeRecord}
  */
 export function writeSwipeRecord(message, swipeIndex, patch) {
-    const existing = readSwipeRecord(message, swipeIndex);
-    const merged = {
-        ...existing,
-        ...patch,
-        version: SCHEMA_VERSION,
-    };
     const target = ensureSwipeRecord(message, swipeIndex);
-    Object.assign(target, merged);
+    Object.assign(target, patch, { version: SCHEMA_VERSION });
+    mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
     return target;
+}
+
+/**
+ * The authoritative copilot root for a swipe, for the mirror to read.
+ * @param {object} message
+ * @param {number} swipeIndex
+ */
+export function swipeRootFor(message, swipeIndex) {
+    return peekSwipeRoot(message, swipeIndex);
 }
 
 /**
  * Every record in the chat, paired with where it lives.
  * @param {object[]} chat
- * @returns {Array<{messageIndex: number, swipeIndex: number, record: object, isCurrentSwipe: boolean}>}
  */
 export function listRecords(chat) {
     if (!Array.isArray(chat)) {
@@ -179,15 +257,16 @@ export function listRecords(chat) {
             continue;
         }
         const current = Number.isInteger(msg.swipe_id) ? msg.swipe_id : 0;
-        const swipes = msg.extra?.[ROOT_KEY]?.swipes ?? [];
-        for (let si = 0; si < swipes.length; si += 1) {
-            if (!isSwipeRecord(swipes[si])) {
+        const infos = Array.isArray(msg.swipe_info) ? msg.swipe_info : [];
+        for (let si = 0; si < infos.length; si += 1) {
+            const rec = readSwipeRecordOrNull(msg, si);
+            if (!rec) {
                 continue;
             }
             out.push({
                 messageIndex: mi,
                 swipeIndex: si,
-                record: coerceSwipeRecord(swipes[si]),
+                record: rec,
                 isCurrentSwipe: si === current,
             });
         }
@@ -198,16 +277,13 @@ export function listRecords(chat) {
 /**
  * All extractions the composer may read, oldest first, for a chat prefix.
  *
- * Sources are the messages UP TO AND INCLUDING `upToMessageIndex`; nothing after
- * it is visible. This is what makes GOAL.md §10.3 S8 (fork at N) correct by
- * construction rather than by a test that has to remember the rule.
- *
- * I2: extraction records that have been merged into another (`compressedInto`)
- * are excluded here and ONLY here. They remain in `listRecords` and on disk.
+ * - Nothing after `upToMessageIndex` is visible. This makes S8 (fork at N)
+ *   correct by construction rather than by a test that has to remember the rule.
+ * - I2: records merged into another (`compressedInto`) are excluded here and ONLY
+ *   here. They remain in `listRecords` and on disk.
  *
  * @param {object[]} chat
  * @param {{upToMessageIndex?: number, excludeSwipeAt?: {messageIndex: number, swipeIndex: number}}} [opts]
- * @returns {Array<{extraction: object, messageIndex: number, swipeIndex: number}>}
  */
 export function collectExtractions(chat, opts = {}) {
     const limit = Number.isInteger(opts.upToMessageIndex) ? opts.upToMessageIndex : (chat?.length ?? 0) - 1;
@@ -234,8 +310,7 @@ export function collectExtractions(chat, opts = {}) {
 }
 
 /**
- * Guard against a stale in-flight generation writing into the wrong place
- * (GOAL.md §12 trap 6: a note composed at message 14 must never appear at 7).
+ * Trap 6 guard: a note composed at message 14 must never be shown at message 7.
  * @param {{messageIndex: number, swipeIndex: number}} a
  * @param {{messageIndex: number, swipeIndex: number}} b
  */
@@ -249,7 +324,6 @@ export function sameSlot(a, b) {
 
 /**
  * I3 snapshot: deep copy of every copilot record in a chat.
- * Kept for snapshot/restore and for the S8 fork assertion.
  * @param {object[]} chat
  */
 export function snapshotChat(chat) {
@@ -262,7 +336,12 @@ export function snapshotChat(chat) {
             }
             out.push({
                 messageIndex: mi,
-                state: JSON.parse(JSON.stringify(msg.extra[ROOT_KEY])),
+                swipeIds: msg.swipe_info
+                    .map((info, si) => (isSwipeRecord(info?.extra?.[ROOT_KEY]?.record) ? si : -1))
+                    .filter((si) => si >= 0),
+                state: JSON.parse(JSON.stringify(
+                    msg.swipe_info.map((info) => (isPlainObject(info?.extra?.[ROOT_KEY]) ? info.extra[ROOT_KEY] : null)),
+                )),
             });
         }
         return { version: SCHEMA_VERSION, messages: out };
@@ -272,62 +351,117 @@ export function snapshotChat(chat) {
 }
 
 /**
- * Restore a snapshot EXACTLY (GOAL.md §10.7 step 2: byte-identical to before).
+ * Restore a snapshot EXACTLY (GOAL.md §10.7 steps 2 and 6).
  *
- * Restoring clears copilot data from messages that the snapshot does not
- * mention — that is what "exact state" means, and skipping it is how a restore
- * silently leaves post-snapshot data behind.
+ * Restoring clears copilot data from swipes the snapshot does not mention —
+ * "exact state" means post-snapshot additions are gone too.
  *
  * @param {object[]} chat
- * @param {{version: number, messages: Array<{messageIndex: number, state: object}>}} snap
+ * @param {{version: number, messages: Array<{messageIndex: number, swipeIds: number[], state: Array<object|null>}>}} snap
  */
 export function restoreChat(chat, snap) {
     if (!Array.isArray(chat) || !snap || !Array.isArray(snap.messages)) {
         return 0;
     }
-    const wanted = new Set(snap.messages.map((m) => m.messageIndex));
+    const wanted = new Map(snap.messages.map((m) => [m.messageIndex, m]));
     let touched = 0;
     for (let mi = 0; mi < chat.length; mi += 1) {
         const msg = chat[mi];
-        if (!wanted.has(mi)) {
+        if (!isPlainObject(msg)) {
+            continue;
+        }
+        const entry = wanted.get(mi);
+        if (!entry) {
             if (hasCopilotData(msg)) {
-                delete msg.extra[ROOT_KEY];
+                clearCopilotData(msg);
                 touched += 1;
             }
             continue;
         }
-        const entry = snap.messages.find((m) => m.messageIndex === mi);
-        if (!msg || typeof msg !== 'object') {
-            continue;
+        for (let si = 0; si < (msg.swipe_info?.length ?? 0); si += 1) {
+            const saved = entry.state[si] ?? null;
+            const info = msg.swipe_info[si];
+            if (saved === null) {
+                if (info?.extra && ROOT_KEY in info.extra) {
+                    delete info.extra[ROOT_KEY];
+                    touched += 1;
+                }
+                continue;
+            }
+            if (!isPlainObject(info)) {
+                continue;
+            }
+            if (!isPlainObject(info.extra)) {
+                info.extra = {};
+            }
+            info.extra[ROOT_KEY] = JSON.parse(JSON.stringify(saved));
+            touched += 1;
         }
-        if (!msg.extra || typeof msg.extra !== 'object') {
-            msg.extra = {};
+        // The mirror belongs to whichever swipe is current.
+        const cur = Number.isInteger(msg.swipe_id) ? msg.swipe_id : 0;
+        const curRoot = peekSwipeRoot(msg, cur);
+        if (curRoot) {
+            mirrorToMessageExtra(msg, cur, curRoot);
+        } else if (isPlainObject(msg.extra) && ROOT_KEY in msg.extra) {
+            delete msg.extra[ROOT_KEY];
         }
-        msg.extra[ROOT_KEY] = JSON.parse(JSON.stringify(entry.state));
-        touched += 1;
     }
     return touched;
 }
 
+/** Remove all copilot data from one message. Only used by restore and by tests. @param {object} message */
+export function clearCopilotData(message) {
+    if (!isPlainObject(message)) {
+        return;
+    }
+    for (const info of (Array.isArray(message.swipe_info) ? message.swipe_info : [])) {
+        if (isPlainObject(info?.extra) && ROOT_KEY in info.extra) {
+            delete info.extra[ROOT_KEY];
+        }
+    }
+    if (isPlainObject(message.extra) && ROOT_KEY in message.extra) {
+        delete message.extra[ROOT_KEY];
+    }
+}
+
 /**
- * Diagnostics for the debug panel: data that does not line up with its swipe.
- * Reported, never auto-deleted (I1).
+ * Report data that does not line up with its swipe. Never auto-deletes (I1).
  * @param {object[]} chat
  */
 export function audit(chat) {
     const issues = [];
     for (let mi = 0; mi < (chat?.length ?? 0); mi += 1) {
         const msg = chat[mi];
-        if (!hasCopilotData(msg)) {
+        if (!isPlainObject(msg)) {
             continue;
         }
-        const stored = msg.extra[ROOT_KEY].swipes.length;
+        const infos = Array.isArray(msg.swipe_info) ? msg.swipe_info : [];
         const live = Array.isArray(msg.swipes) ? msg.swipes.length : 0;
-        if (stored > live && !(live === 0 && stored === 1)) {
-            issues.push({ messageIndex: mi, kind: 'orphan-swipes', stored, live });
+
+        if (hasCopilotData(msg)) {
+            infos.forEach((info, si) => {
+                if (!isSwipeRecord(info?.extra?.[ROOT_KEY]?.record)) {
+                    return;
+                }
+                if (si >= live && !(live === 0 && si === 0)) {
+                    issues.push({ messageIndex: mi, kind: 'orphan-swipe', swipeIndex: si, liveSwipes: live });
+                }
+            });
         }
-        if (Number.isInteger(msg.swipe_id) && msg.swipe_id >= Math.max(stored, 1)) {
-            issues.push({ messageIndex: mi, kind: 'swipe-id-past-data', swipeId: msg.swipe_id, stored });
+
+        // Checked OUTSIDE the hasCopilotData gate on purpose: a mirror whose
+        // authoritative source is gone is exactly the state where the next
+        // SillyTavern sync will overwrite real data, and by then
+        // hasCopilotData() reports "nothing here", so gating would hide it.
+        const cur = Number.isInteger(msg.swipe_id) ? msg.swipe_id : 0;
+        const sourceHas = isSwipeRecord(infos[cur]?.extra?.[ROOT_KEY]?.record);
+        const mirrorHas = isSwipeRecord(msg.extra?.[ROOT_KEY]?.record);
+        if (mirrorHas && !sourceHas) {
+            issues.push({
+                messageIndex: mi,
+                kind: 'mirror-without-source',
+                detail: `message.extra.${ROOT_KEY} has a record but swipe_info[${cur}] does not`,
+            });
         }
     }
     return issues;

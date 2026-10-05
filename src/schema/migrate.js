@@ -144,9 +144,11 @@ export function migrateRecord(raw, ctx = {}) {
 /**
  * Migrate every copilot record in a chat, in place.
  *
+ * Walks `message.swipe_info[i].extra.copilot` — the authoritative per-swipe slot
+ * (see store.js for why the mirror at `message.extra.copilot` is not walked).
+ *
  * @param {object[]} chat
  * @param {{dryRun?: boolean}} [opts]
- * @returns {{changed: number, inspected: number, future: number, unreadable: number, problems: Array<{messageIndex: number, swipeIndex: number, problem: string}>}}
  */
 export function migrateChat(chat, opts = {}) {
     const report = { changed: 0, inspected: 0, future: 0, unreadable: 0, problems: [] };
@@ -154,28 +156,32 @@ export function migrateChat(chat, opts = {}) {
         return report;
     }
     for (let mi = 0; mi < chat.length; mi += 1) {
-        const root = chat[mi]?.extra?.[ROOT_KEY];
-        if (!root || typeof root !== 'object' || !Array.isArray(root.swipes)) {
+        const infos = chat[mi]?.swipe_info;
+        if (!Array.isArray(infos)) {
             continue;
         }
-        if (!Number.isInteger(root.version)) {
-            root.version = 0;
-        }
-        if (root.version > MAX_SUPPORTED_VERSION) {
-            report.future += 1;
-            report.problems.push({ messageIndex: mi, swipeIndex: -1, problem: `message root is schema v${root.version}` });
-            continue;
-        }
-        if (root.version !== SCHEMA_VERSION && !opts.dryRun) {
-            root.version = SCHEMA_VERSION;
-        }
-        for (let si = 0; si < root.swipes.length; si += 1) {
-            const raw = root.swipes[si];
-            if (raw === null || raw === undefined) {
+        for (let si = 0; si < infos.length; si += 1) {
+            const root = infos[si]?.extra?.[ROOT_KEY];
+            if (!root || typeof root !== 'object') {
+                continue;
+            }
+            if (!Number.isInteger(root.version)) {
+                root.version = 0;
+            }
+            if (root.version > MAX_SUPPORTED_VERSION) {
+                report.future += 1;
+                report.problems.push({ messageIndex: mi, swipeIndex: si, problem: `swipe root is schema v${root.version}` });
+                continue;
+            }
+            if (root.version !== SCHEMA_VERSION && !opts.dryRun) {
+                root.version = SCHEMA_VERSION;
+            }
+
+            if (!('record' in root) || root.record === null || root.record === undefined) {
                 continue;
             }
             report.inspected += 1;
-            const result = migrateRecord(raw, { messageIndex: mi, swipeIndex: si });
+            const result = migrateRecord(root.record, { messageIndex: mi, swipeIndex: si });
             if (result.status === 'future') {
                 report.future += 1;
                 report.problems.push({ messageIndex: mi, swipeIndex: si, problem: result.problem });
@@ -185,13 +191,13 @@ export function migrateChat(chat, opts = {}) {
                 report.unreadable += 1;
                 report.problems.push({ messageIndex: mi, swipeIndex: si, problem: result.problem });
                 if (!opts.dryRun) {
-                    // I6: degrade to no-data rather than keeping something we cannot read.
-                    root.swipes[si] = null;
+                    // I6: degrade to no-data rather than keeping something unreadable.
+                    root.record = null;
                 }
                 continue;
             }
             if (result.migrated && !opts.dryRun) {
-                root.swipes[si] = result.record;
+                root.record = result.record;
                 report.changed += 1;
             }
         }
@@ -208,15 +214,16 @@ export function needsMigration(chat) {
         return false;
     }
     for (const msg of chat) {
-        const root = msg?.extra?.[ROOT_KEY];
-        if (!root || typeof root !== 'object') {
-            continue;
-        }
-        if (root.version !== SCHEMA_VERSION) {
-            return true;
-        }
-        for (const raw of (Array.isArray(root.swipes) ? root.swipes : [])) {
-            if (raw && typeof raw === 'object' && raw.version !== SCHEMA_VERSION) {
+        const infos = Array.isArray(msg?.swipe_info) ? msg.swipe_info : [];
+        for (const info of infos) {
+            const root = info?.extra?.[ROOT_KEY];
+            if (!root || typeof root !== 'object') {
+                continue;
+            }
+            if (root.version !== SCHEMA_VERSION) {
+                return true;
+            }
+            if (root.record && typeof root.record === 'object' && root.record.version !== SCHEMA_VERSION) {
                 return true;
             }
         }
