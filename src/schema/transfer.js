@@ -97,7 +97,20 @@ export function importChatState(chat, meta, state) {
         }
     }
 
-    const messageIndex = chat.length - 1;
+    // F19 (critique round 1): attach to the LAST ASSISTANT message. Creating
+    // swipe_info on a user message means deleting/editing that line takes the
+    // imported memory with it — and bindToMessage refuses user messages, so the
+    // placement contradicted the rest of the system.
+    let messageIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i -= 1) {
+        if (chat[i] && !chat[i].is_user) {
+            messageIndex = i;
+            break;
+        }
+    }
+    if (messageIndex < 0) {
+        return { ok: false, reason: 'the target chat has no assistant message to attach the import to', added: 0, snapshot: null, metaSnapshot: null };
+    }
     const last = chat[messageIndex];
     const swipeIndex = Number.isInteger(last?.swipe_id) ? last.swipe_id : 0;
     let added = 0;

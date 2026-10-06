@@ -865,7 +865,12 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
     lastToken = nextToken();
     lorebookEntries = new Map();
     clearNote();
-    clearPending(SKIP.STALE_GENERATION);
+    const droppedPending = clearPending(SKIP.STALE_GENERATION);
+    if (droppedPending) {
+        // Trap 14 + I1 (F13, critique round 1): dropping a composed note and its
+        // extraction with NO log line is undiagnosable. Say it happened.
+        log.warn('inject', `dropped a pending note/extraction (${droppedPending}) — the previous generation never landed a reply`);
+    }
     rerollChoice = null;
     const s = settings();
     if (!s.enabled) {
@@ -1001,10 +1006,15 @@ async function injectIntoUnsafe(payload, shape) {
     // Phase 3: the popup's "reuse the current one" — no model call, the note
     // goes in again, and the record SAYS it was reused instead of pretending a
     // fresh composition happened.
+    //
+    // F6 (critique round 1): `lastNote` is in-memory — after a reload or chat
+    // switch it is null and 'reuse' silently composed a NEW note instead. Fall
+    // back to the STORED note so the user's choice survives.
+    const storedNote = lastNote ?? previousNoteFor(chat());
     const wantsReuse = Boolean(rerollChoice && rerollChoice.token === token
-        && rerollChoice.choice === 'reuse' && lastNote);
+        && rerollChoice.choice === 'reuse' && storedNote);
     if (wantsReuse) {
-        note = lastNote;
+        note = storedNote;
         turn.reroll = 'reused the previous note (user choice)';
         composerRecord = {
             text: note, model: '(reused from the previous turn)',
@@ -1014,7 +1024,7 @@ async function injectIntoUnsafe(payload, shape) {
         log.info('reroll', `reusing the current note for token ${token} — no model call`);
     } else {
         const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
-        const oldNote = lastNote ?? '';
+        const oldNote = storedNote ?? '';
         let input = await collectInput(token);
         const oldExtraction = (input.extractions ?? []).at(-1)?.text ?? '';
         let rerolls = 0;
@@ -1267,13 +1277,13 @@ function maybeAutoCompress() {
 
 function onChatChanged() {
     // Trap 7: everything in flight is abandoned on a chat change.
-    clearPending(SKIP.CHAT_CHANGED);
+    const droppedOnSwitch = clearPending(SKIP.CHAT_CHANGED);
     resetTokens();
     injectedTokens.clear();
     lorebookEntries = new Map();
     lastNote = null;
     clearNote();
-    log.info('chat', 'chat changed — pending state cleared');
+    log.info('chat', `chat changed — pending state cleared${droppedOnSwitch ? ` (dropped a pending ${droppedOnSwitch})` : ''}`);
 }
 
 /* -------------------------------------------------------------- diagnostics */
