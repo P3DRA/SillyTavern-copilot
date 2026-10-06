@@ -272,8 +272,15 @@ export function judge(raw, opts = {}) {
     if (NON_PROSE.some((p) => p.test(body))) {
         return { ok: false, text: body, reason: REJECT.NOT_PROSE, words, detail: 'output is not prose' };
     }
-    if (words < minWords) {
-        return { ok: false, text: body, reason: REJECT.TOO_SHORT, words, detail: `${words} words < ${minWords}` };
+    // Trap 19 (R2-15): the prompt says "writing nothing at all is correct and
+    // better than padding" — a hard 15-word floor FORCES padding on thin scenes
+    // and burned whole fallback chains on short-but-correct notes (a live
+    // composer failed 4 attempts for a 14-word answer). The floor is a GARBAGE
+    // floor: empty and 1-2 word answers ("OK") are still rejected; anything
+    // with real content is accepted. maxWords stays hard. (The user can still
+    // set minWords below 3 to tighten it.)
+    if (words < Math.min(minWords, 3)) {
+        return { ok: false, text: body, reason: REJECT.TOO_SHORT, words, detail: `${words} words (garbage floor; configured minimum ${minWords} is soft)` };
     }
     if (words > maxWords) {
         return { ok: false, text: body, reason: REJECT.TOO_LONG, words, detail: `${words} words > ${maxWords}` };

@@ -27,7 +27,7 @@
 import { EVENT, GENERATION_TYPE, NOTE_TAG } from './src/st/constants.js';
 import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log.js';
 import { runPipeline } from './src/core/pipeline.js';
-import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord } from './src/schema/store.js';
+import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord, restoreChat } from './src/schema/store.js';
 import { mergeLoreEntries } from './src/core/prompts.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
@@ -147,25 +147,32 @@ function settings() {
     };
 }
 
+/**
+ * R2-8 / GOAL §9.2 — the key resolution chain, honestly documented:
+ *   1. `settings.apiKey` — set from this panel; stored PLAINTEXT inside
+ *      extension_settings (the UI says so).
+ *   2. ST's server-side OpenRouter secret — the REAL secret store:
+ *      `/scripts/secrets.js` `secret_state[SECRET_KEYS.OPENROUTER]`. The old
+ *      code called `ctx().getSecret`, which does not exist in the context at
+ *      all — that branch was dead code and the placeholder lied about it.
+ * The secret is cached here and refreshed at init and every turn start.
+ */
+let stSecretKey = '';
+
+async function refreshSecretKey() {
+    try {
+        const sec = await import('/scripts/secrets.js');
+        const name = sec.SECRET_KEYS?.OPENROUTER ?? 'api_key_openrouter';
+        const v = sec.secret_state?.[name];
+        stSecretKey = Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '');
+    } catch {
+        stSecretKey = '';
+    }
+    return stSecretKey;
+}
+
 function apiKey() {
-    const s = settings();
-    const stored = ctx().extensionSettings?.[SETTINGS_KEY];
-    // Accept a direct key, or a SillyTavern secret reference so the key can live
-    // in the server-side secret store rather than in localStorage.
-    const direct = stored?.apiKey;
-    if (direct) {
-        return direct;
-    }
-    const ref = stored?.apiKeySecret;
-    if (ref && ctx().getSecret) {
-        try {
-            const v = ctx().getSecret(ref);
-            return Array.isArray(v) ? v[0] : v;
-        } catch {
-            return null;
-        }
-    }
-    return null;
+    return String(settings().apiKey || stSecretKey || '') || null;
 }
 
 function saveSettings(patch) {
@@ -1796,7 +1803,16 @@ function installPanel() {
                     <input type="text" data-cset="mergeCount" value="${escapeHtml(String(s.compress?.mergeCount ?? 10))}" size="4" title="how many oldest to merge" />
                     <button type="button" data-act="compress-settings">Save</button>
                     <button type="button" data-act="compress-auto">Run auto-compress now</button>
-                </div>`;
+                </div>
+                ${(ctx().chatMetadata?.copilot?.snapshots ?? []).length ? `
+                <div class="copilot-gr-head"><strong>pre-op snapshots (I3)</strong>
+                    <em class="copilot-spend-note">restore returns to the snapshot — records created AFTER it are removed (you will be asked first)</em>
+                </div>
+                ${(ctx().chatMetadata?.copilot?.snapshots ?? []).map((snap, i) => `
+                    <div class="copilot-gr-item">
+                        <span class="copilot-c-text">snapshot ${i + 1} — ${(snap?.messages ?? []).length} recorded messages</span>
+                        <button type="button" data-act="restore-snap" data-snap="${i}">Restore</button>
+                    </div>`).join('')}` : ''}`;
         } catch (err) {
             compressEl.textContent = `compressor unavailable: ${redact(String(err?.message ?? err))}`;
         }
@@ -1824,6 +1840,42 @@ function installPanel() {
             log.info('compress', `settings saved: auto=${auto} maxVisible=${val('maxVisible')} mergeCount=${val('mergeCount')}`);
         } else if (act === 'toggle-pin' || act === 'toggle-protect') {
             toggleEntryFlag(String(btn.dataset.extId ?? ''), act === 'toggle-pin' ? 'pinned' : 'protected');
+        } else if (act === 'restore-snap') {
+            // R2-10 (I3): "restore works from the UI" — the snapshots ring was
+            // written but unreachable. Restore is DESTRUCTIVE for records
+            // created after the snapshot (T-R2-14), so it asks first; the
+            // benign timeout answer is 'no'.
+            const idx = Number(btn.dataset.snap);
+            const meta = ctx().chatMetadata?.copilot ?? {};
+            const snap = (meta.snapshots ?? [])[idx];
+            if (!snap) {
+                log.warn('compress', 'that snapshot no longer exists');
+            } else {
+                const visibleNow = collectExtractions(chat()).length;
+                let answer = 'no';
+                try {
+                    const PopupCls = ctx().Popup;
+                    if (PopupCls?.show?.confirm) {
+                        answer = await popupWithTimeout(
+                            PopupCls.show.confirm(
+                                'Restore snapshot',
+                                `Restore pre-op snapshot ${idx + 1}? Records created AFTER it (currently ${visibleNow} visible extractions) will be REMOVED.`,
+                                { okButton: 'Restore', cancelButton: 'Keep the current state' },
+                            ).then((r) => (r === 1 ? 'yes' : 'no')),
+                            20000, 'no', 'restore-snapshot confirm',
+                        );
+                    }
+                } catch {
+                    answer = 'no';
+                }
+                if (answer === 'yes') {
+                    const touched = restoreChat(chat(), snap);
+                    saveChatConditional?.();
+                    log.warn('compress', `snapshot ${idx + 1} restored — ${touched} record slots touched (post-snapshot records removed)`);
+                } else {
+                    log.info('compress', 'restore cancelled — nothing changed');
+                }
+            }
         }
         renderCompress();
         render();
@@ -1914,7 +1966,9 @@ function installPanel() {
                     <em class="copilot-spend-note">§6 configuration — chains are comma-separated; a blank key uses the ST secret</em>
                 </div>
                 <div class="copilot-set-grid">
-                    <label>API key <input type="password" data-set="apiKey" placeholder="blank = the api_key_openrouter secret" /></label>
+                    <label>API key <input type="password" data-set="apiKey" placeholder="blank = use ST's OpenRouter secret (server-side)" /></label>
+                    <label>key storage <button type="button" data-act="settings-clear-key">Clear saved key</button>
+                        <em class="copilot-spend-note">a key typed here is stored PLAINTEXT in extension settings</em></label>
                     <label>baseUrl <input type="text" data-set="baseUrl" /></label>
                     <label>extractor chain <input type="text" data-set="extractorChain" /></label>
                     <label>extractor temp / tokens <input type="text" data-set="extractorTemp" size="4" /> <input type="text" data-set="extractorMaxTokens" size="6" /></label>
@@ -1954,8 +2008,18 @@ function installPanel() {
         }
     };
     settingsEl.addEventListener('click', (ev) => {
-        const btn = ev.target.closest?.('button[data-act="settings-save"]');
+        const btn = ev.target.closest?.('button[data-act="settings-save"], button[data-act="settings-clear-key"]');
         if (!btn) {
+            return;
+        }
+        // T-R2-9: there used to be NO way to remove a stored key.
+        if (btn.dataset.act === 'settings-clear-key') {
+            saveSettings({ apiKey: '' });
+            const input = settingsEl.querySelector('[data-set="apiKey"]');
+            if (input) {
+                input.value = '';
+            }
+            log.info('settings', 'saved API key cleared — the ST server-side secret is used if present');
             return;
         }
         try {
@@ -2117,6 +2181,7 @@ function init() {
         // narrator turns. It used to be bumped here too — twice per turn — and
         // setPending()/bindToMessage() disagreed about the token, so every note
         // failed to bind as "stale_generation_aborted".
+        refreshSecretKey(); // R2-8: pick up secret-store changes (fire-and-forget)
         return onGenerationStarted(type, opts ?? {}, dryRun === true);
     });
     es.on(EVENT.CHAT_COMPLETION_PROMPT_READY, (data) => onPromptReady(data, EVENT.CHAT_COMPLETION_PROMPT_READY));
@@ -2127,6 +2192,7 @@ function init() {
 
     installWatcher();
     installPanel();
+    refreshSecretKey(); // R2-8: seed the ST-secret cache at boot
 
     // Exposed for the T3 driver and for the user in the console. Never holds a
     // secret: apiKey() is a function, not a value.

@@ -167,6 +167,15 @@ export function readSwipeRecordOrNull(message, swipeIndex) {
     // exact opposite of migrate.js's own rule "carry anything unknown through
     // untouched"). Unknown keys now ride along untouched; migration owns
     // normalisation.
+    //
+    // T-R2-12: and never NULL a field that is present — coerce drops objects
+    // without a text key, and the assign used to overwrite them with null ON
+    // READ (present-but-oddly-shaped still beats destroyed).
+    for (const k of ['extraction', 'composer', 'injection']) {
+        if (normalised[k] === null && root.record[k] !== undefined && root.record[k] !== null) {
+            delete normalised[k];
+        }
+    }
     Object.assign(root.record, normalised);
     return root.record;
 }
@@ -252,10 +261,20 @@ export function writeSwipeRecord(message, swipeIndex, patch) {
             }
         }
         if (hadData) {
+            // T-R2-12: history copies must not balloon — attempts carry 2k-char
+            // failure raws that would be re-copied on every same-slot rewrite.
+            if (snapshot.composer && Array.isArray(snapshot.composer.attempts)) {
+                snapshot.composer = {
+                    ...snapshot.composer,
+                    attempts: snapshot.composer.attempts.map((a) => ({ ...a, raw: undefined })),
+                };
+            }
             target.history = [...(Array.isArray(target.history) ? target.history : []), snapshot];
         }
     }
-    Object.assign(target, patch, { version: SCHEMA_VERSION });
+    // R2-25: never DOWNGRADE the schema version on write (migrate.js's rule) —
+    // the stamp used to force SCHEMA_VERSION over a newer build's number.
+    Object.assign(target, patch, { version: Math.max(Number(target.version) || 0, SCHEMA_VERSION) });
     mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
     return target;
 }
