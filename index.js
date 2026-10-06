@@ -2180,7 +2180,18 @@ function installPanel() {
                 recordsEl.innerHTML = '<div class="copilot-record-empty">no copilot records in this chat yet</div>';
                 return;
             }
-            const last = entries.length - 1;
+            // Reviewer-21 (trap 12): the badge belongs to the record with the
+            // LATEST actual injection — list order can crown a superseded
+            // (non-current-swipe) record.
+            let latestIdx = -1;
+            let latestAt = 0;
+            entries.forEach((e, i) => {
+                const at = Number(e.record?.injection?.injectedAt ?? 0);
+                if (at > latestAt) {
+                    latestAt = at;
+                    latestIdx = i;
+                }
+            });
             recordsEl.innerHTML = entries.map((e, i) => {
                 const rec = e.record;
                 const stale = rec.composer?.staleFlag === true;
@@ -2188,7 +2199,7 @@ function installPanel() {
                 <div class="copilot-record" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
                     <div class="copilot-record-head">
                         <strong>message ${e.messageIndex} · swipe ${e.swipeIndex}</strong>
-                        ${i === last ? '<em class="copilot-badge copilot-badge-latest">last injected note</em>' : ''}
+                        ${i === latestIdx && latestAt > 0 ? '<em class="copilot-badge copilot-badge-latest">last injected note</em>' : ''}
                         ${e.isCurrentSwipe ? '<em class="copilot-badge">current swipe</em>' : ''}
                         ${rec.composer?.edited ? '<em class="copilot-badge">note edited</em>' : ''}
                         ${rec.extraction?.edited ? '<em class="copilot-badge">extraction edited</em>' : ''}

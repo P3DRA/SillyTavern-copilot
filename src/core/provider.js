@@ -64,11 +64,20 @@ export function isReasoningModel(model) {
 }
 
 export function maxTokensFor(model, override) {
-    if (Number.isFinite(override) && override > 0) {
-        return Math.floor(override);
+    // Trap 17 / Reviewer-16: max_tokens is PER MODEL in a fallback chain — one
+    // blanket number must not clobber the per-model budgets (a reasoning model
+    // silently produced nothing under a small blanket value; that is what
+    // MODEL_BUDGETS exists for). A per-model MAP overrides any single model;
+    // a plain number applies only to models MODEL_BUDGETS does not know.
+    if (override && typeof override === 'object'
+        && Number.isFinite(Number(override[model])) && Number(override[model]) > 0) {
+        return Math.floor(Number(override[model]));
     }
     if (Object.hasOwn(MODEL_BUDGETS, model)) {
         return MODEL_BUDGETS[model];
+    }
+    if (Number.isFinite(override) && override > 0) {
+        return Math.floor(override);
     }
     return isReasoningModel(model) ? 4096 : MODEL_BUDGETS.default;
 }

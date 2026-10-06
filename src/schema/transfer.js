@@ -17,7 +17,7 @@
  */
 
 import {
-    makeExtraction, makeGoal, makeUserRequest,
+    makeExtraction, makeGoal, makeUserRequest, noteHash,
 } from './records.js';
 import { listRecords, snapshotChat, restoreChat, appendExtraExtraction, ROOT_KEY } from './store.js';
 
@@ -120,16 +120,31 @@ export function importChatState(chat, meta, state) {
             continue;
         }
         const ex = makeExtraction(raw);
+        if (!raw.id) {
+            // Reviewer-22: id-less entries minted a FRESH id on every import, so
+            // re-importing the same bundle duplicated them. Derive a stable id
+            // from the content instead — imports stay idempotent.
+            const h = noteHash(raw.text ?? '');
+            if (h) {
+                ex.id = `ext_${h}`;
+            }
+        }
         if (known.has(ex.id)) {
             continue;
         }
-        // Remember slots this import had to CREATE from nothing — restore must
-        // be able to remove them again or "exact" is a lie.
-        const hadInfo = Boolean(Array.isArray(last.swipe_info) && last.swipe_info[swipeIndex]);
+        // Remember EVERY slot this import had to CREATE from nothing — restore
+        // must be able to remove them again or "exact" is a lie. ensureSwipeRoot
+        // backfills one slot PER SWIPE, so tracking only the target slot left
+        // scaffolding behind (T-R2-14).
+        const beforeSlots = Array.isArray(last.swipe_info) ? last.swipe_info.map((info) => Boolean(info)) : [];
         appendExtraExtraction(last, swipeIndex, ex);
-        if (!hadInfo && Array.isArray(last.swipe_info) && last.swipe_info[swipeIndex]
-            && !createdSlots.some((c) => c.messageIndex === messageIndex && c.swipeIndex === swipeIndex)) {
-            createdSlots.push({ messageIndex, swipeIndex });
+        if (Array.isArray(last.swipe_info)) {
+            last.swipe_info.forEach((info, si) => {
+                if (!beforeSlots[si] && info
+                    && !createdSlots.some((c) => c.messageIndex === messageIndex && c.swipeIndex === si)) {
+                    createdSlots.push({ messageIndex, swipeIndex: si });
+                }
+            });
         }
         known.add(ex.id);
         added += 1;
@@ -171,18 +186,26 @@ export function restoreImport(chat, meta, saved) {
     // (its old `.ok` check was dead code, critique round 1 finding 18).
     restoreChat(chat, saved.snapshot);
     // Remove any swipe_info slots the import had to create — restore means
-    // EXACTLY the pre-import structure, scaffolding included. Rebuild the array
-    // rather than splicing mid-array (T-R2-14): a splice shifts later slots
-    // onto the wrong swipes when the message has several.
-    for (const slot of (saved.createdSlots ?? [])) {
-        const msg = chat?.[slot.messageIndex];
-        if (msg && Array.isArray(msg.swipe_info)) {
-            msg.swipe_info = msg.swipe_info.filter((info, si) => !(
-                si === slot.swipeIndex
-                && info
-                && !(info.extra && info.extra[ROOT_KEY] && typeof info.extra[ROOT_KEY] === 'object')
-            ));
+    // EXACTLY the pre-import structure, scaffolding included. ONE pass per
+    // message (T-R2-14): per-slot splices/filters shift later indices when
+    // several slots were backfilled.
+    const perMessage = new Map();
+    for (const c of (saved.createdSlots ?? [])) {
+        if (!perMessage.has(c.messageIndex)) {
+            perMessage.set(c.messageIndex, new Set());
         }
+        perMessage.get(c.messageIndex).add(c.swipeIndex);
+    }
+    for (const [mi, slots] of perMessage) {
+        const msg = chat?.[mi];
+        if (!msg || !Array.isArray(msg.swipe_info)) {
+            continue;
+        }
+        msg.swipe_info = msg.swipe_info.filter((info, si) => !(
+            slots.has(si)
+            && info
+            && !(info.extra && info.extra[ROOT_KEY] && typeof info.extra[ROOT_KEY] === 'object')
+        ));
     }
     // Metadata: reset the tracked lists to the snapshot's copies — and DELETE
     // the keys entirely when the snapshot had none, so "byte-identical" is
