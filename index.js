@@ -32,7 +32,7 @@ import { mergeLoreEntries, DEFAULT_EXTRACTOR_PROMPT, DEFAULT_COMPOSER_PROMPT, DE
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
     noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
-    noteTextOf, pushSnapshot,
+    noteTextOf, pushSnapshot, isCompressedAway,
 } from './src/schema/records.js';
 import { emptySpend, recordSpend, spendSummary } from './src/core/spend.js';
 import {
@@ -139,6 +139,8 @@ const DEFAULTS = {
     // The compressor's own model chain (§6: the compressor is a role) — falls
     // back to the extractor's chain when empty.
     compressorChain: [],
+    /** User-saved template bundles (T-R4-5: "save your current template"). */
+    customTemplates: [],
 };
 
 function settings() {
@@ -247,6 +249,61 @@ function saveSettings(patch) {
 /* ------------------------------------------------------------------- inputs */
 
 /**
+ * The character as context for the guidance writer: the name first, then the
+ * card's description when one exists (capped — the composer's window is
+ * budgeted and a full example dialogue must never eat it).
+ */
+function characterCardText() {
+    try {
+        const c = ctx();
+        const ch = c.characters?.[c.characterId];
+        const name = String(ch?.name ?? c.name2 ?? '').trim();
+        const desc = String(ch?.description ?? '').trim().slice(0, 1500);
+        if (!name && !desc) {
+            return '';
+        }
+        return desc ? `${name}\n${desc}` : name;
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * The narrator's standing instructions — the live system prompt. `ctx().systemPrompt`
+ * (the old source) does not exist in ST's context, so the block was always
+ * empty. The chat-completion system prompt is `oai_settings.main_prompt`,
+ * exposed as `chatCompletionSettings` (st-context.js:226).
+ */
+function narratorPromptText() {
+    try {
+        const c = ctx();
+        // T-R4-12 (user report: the block "still isn't getting any injections"):
+        // on modern ST the standing instructions live in the PROMPT MANAGER's
+        // collection — oai_settings.prompts, entry identifier 'main'
+        // (PromptManager.getPromptById('main') reads serviceSettings.prompts).
+        // `main_prompt` is a legacy field and is EMPTY there, so the old chain
+        // found nothing at all.
+        const prompts = c.chatCompletionSettings?.prompts;
+        const fromManager = Array.isArray(prompts)
+            ? prompts.find((p) => p && p.identifier === 'main' && typeof p.content === 'string' && p.content.trim())
+            : null;
+        for (const v of [
+            fromManager?.content,
+            c.chatCompletionSettings?.main_prompt,
+            c.chatCompletionSettings?.system_prompt,
+            c.powerUserSettings?.main_prompt,
+        ]) {
+            if (typeof v === 'string' && v.trim()) {
+                return v.trim().slice(0, 3000);
+            }
+        }
+    } catch {
+        // Context shape drifts between ST versions — an empty block is honest.
+    }
+    return '';
+}
+
+/**
  * Collect the context the pipeline needs from the live chat.
  *
  * Reached through `ctx()` FRESH every time. Nothing here is cached across a
@@ -282,17 +339,55 @@ async function collectInput(turnId) {
     // Extractions the composer may read: everything up to and including the
     // message we are answering, excluding the slot being written. Compressed
     // originals are excluded here and ONLY here (I2).
-    const extractions = collectExtractions(list, {
+    const visible = collectExtractions(list, {
         excludeSwipeAt: { messageIndex: list.length, swipeIndex: 0 },
-    }).map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 }));
+    });
+    const extractions = visible.map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 }));
+
+    // T-R4-6 (user redesign, CRITICAL): rolling-state inputs. The LATEST state
+    // is the newest visible extraction; the extractor gets ONLY the messages not
+    // yet folded into it — never the whole chat again ("the extractor is
+    // receiving ALL messages, that makes no sense").
+    let previousState = '';
+    let previousStateSource = -1;
+    for (const e of visible) {
+        if (e.messageIndex > previousStateSource && String(e.extraction.text ?? '').trim()) {
+            previousState = String(e.extraction.text);
+            previousStateSource = e.messageIndex;
+        }
+    }
+    let extractMessages;
+    if (previousStateSource >= 0) {
+        // The DELTA is built from the full chat (not the composer's window cap)
+        // and the pipeline's own extractor budget trims it afterwards.
+        extractMessages = [];
+        for (let i = previousStateSource + 1; i < list.length; i += 1) {
+            const m = list[i];
+            const text = typeof m?.mes === 'string' ? m.mes : '';
+            if (text.trim() === '' || m?.is_system) {
+                continue;
+            }
+            extractMessages.push({ role: m.is_user ? 'user' : 'assistant', text });
+        }
+    } else {
+        extractMessages = messages;
+    }
 
     const meta = ctx().chatMetadata?.copilot ?? {};
     return {
         messages,
         extractions,
+        extractMessages,
+        previousState,
+        previousStateSource,
         lorebook: readLorebook(await readPermanentLorebook()),
-        characterCard: ctx().name2 ?? '',
-        narratorPrompt: ctx().systemPrompt ?? '',
+        // T-R4-4: the block headed "About the character you are writing for"
+        // used to carry NOTHING but the name (confusing: it read as broken), and
+        // "The narrator's standing instructions" was ALWAYS empty because
+        // `ctx().systemPrompt` does not exist in ST's context. Both are real
+        // content now.
+        characterCard: characterCardText(),
+        narratorPrompt: narratorPromptText(),
         userRequest: activeRequestText(meta),
         // Script-tracked goal FACTS (S6): the counters are computed here, never
         // by the model. goalFacts drops completed goals.
@@ -576,6 +671,9 @@ function compressorCall(messages) {
         messages,
         temperature: s.extractor?.temperature ?? 0.2,
         maxTokens: s.extractor?.maxTokens,
+        role: 'compressor',
+        reasoning: s.extractor?.reasoning,
+        retryHint: 'Merge by union in the exact <compressed> structure from the prompt — keep every fact.',
         minWords: 1,
         maxWords: 20000,
         onEvent: (e) => {
@@ -1485,7 +1583,7 @@ function roleCode(role) {
  * through the edit helpers, which keep the superseded value in `history` (I1)
  * and — for extractions — flag the dependent composer entry stale (§6).
  */
-function editRecordField(messageIndex, swipeIndex, field, text) {
+function editRecordField(messageIndex, swipeIndex, field, text, entryId) {
     try {
         const list = chat();
         const message = list?.[Number(messageIndex)];
@@ -1498,7 +1596,7 @@ function editRecordField(messageIndex, swipeIndex, field, text) {
         }
         const res = field === 'composer'
             ? applyComposerEdit(record, text)
-            : applyExtractionEdit(record, text);
+            : applyExtractionEdit(record, text, entryId !== undefined ? { entryId } : {});
         if (res.ok) {
             writeSwipeRecord(message, Number(swipeIndex), {}); // re-mirror the updated root
             saveChatConditional?.();
@@ -1519,6 +1617,60 @@ function editNote(messageIndex, swipeIndex, text) {
 
 function editExtraction(messageIndex, swipeIndex, text) {
     return editRecordField(messageIndex, swipeIndex, 'extraction', text);
+}
+
+/**
+ * T-R4-9: open one FULL extraction in a popup — readable and editable. The
+ * compressor list truncates to 90 chars and the old tag wrappers made entries
+ * unreadable ("it doesn't let me read the extraction"). OK saves through the
+ * normal edit path (I1 history + stale flag on the note); Cancel/ESC discards.
+ */
+async function viewExtraction(extId) {
+    try {
+        const list = chat();
+        let found = null;
+        let target = null;
+        for (const e of listRecords(list)) {
+            const all = [
+                ...(e.record.extraction ? [e.record.extraction] : []),
+                ...(Array.isArray(e.record.extractions) ? e.record.extractions.filter(Boolean) : []),
+            ];
+            const hit = all.find((x) => x && x.id === extId);
+            if (hit) {
+                found = e;
+                target = hit;
+                break;
+            }
+        }
+        if (!found || !target) {
+            log.warn('compress', 'that extraction no longer exists');
+            return;
+        }
+        const { Popup, POPUP_TYPE } = await import('/scripts/popup.js');
+        const wrap = document.createElement('div');
+        const ta = document.createElement('textarea');
+        ta.value = String(target.text ?? '');
+        ta.rows = 22;
+        ta.style.width = '100%';
+        ta.style.boxSizing = 'border-box';
+        wrap.append(ta);
+        const popup = new Popup(wrap, POPUP_TYPE.TEXT, `extraction ${target.id} — message ${found.messageIndex}.${found.swipeIndex}`, {
+            okButton: 'Save', cancelButton: 'Close', wide: true, large: true, allowVerticalScrolling: true,
+        });
+        const result = await popupWithTimeout(popup.show(), 600000, 0, 'extraction popup');
+        if (result !== 1) {
+            log.info('compress', 'extraction popup closed — nothing changed');
+            return;
+        }
+        const res = editRecordField(found.messageIndex, found.swipeIndex, 'extraction', ta.value, target.id);
+        if (res.ok) {
+            log.info('compress', `extraction ${target.id} saved from the popup — the note is flagged stale`);
+        } else {
+            log.warn('compress', `extraction edit refused: ${res.reason}`);
+        }
+    } catch (err) {
+        log.warn('compress', `extraction popup failed: ${redact(String(err?.message ?? err))}`);
+    }
 }
 
 function onMessageReceived() {
@@ -1645,7 +1797,22 @@ function maybeAutoCompress() {
     }
 }
 
-function onChatChanged() {
+let lastChatIdSeen = null;
+
+function onChatChanged(chatId) {
+    // T-R4-11 (user report: "── turn 1 ── now it stays capped at 1 and doesn't
+    // increment"): ST's CHAT_CHANGED also fires when the SAME chat is RELOADED
+    // (reloadCurrentChatUnsafe after saves, getChatResult, etc.), and every fire
+    // cleared the debug log and bumped the chat epoch — so the turn counter
+    // restarted on essentially every turn. Only a REAL chat switch resets this
+    // state; same-chat reloads are ignored.
+    const switched = chatId === undefined ? true : chatId !== lastChatIdSeen;
+    if (chatId !== undefined) {
+        lastChatIdSeen = chatId;
+    }
+    if (!switched) {
+        return;
+    }
     // Trap 7: everything in flight is abandoned on a chat change.
     chatSeq += 1; // F12: turn ids never collide across chats
     generationKind = 'none'; // R2-1
@@ -1657,7 +1824,11 @@ function onChatChanged() {
     lorebookEntries = new Map();
     lastNote = null;
     clearNote();
-    log.info('chat', `chat changed — pending state cleared${droppedOnSwitch ? ` (dropped a pending ${droppedOnSwitch})` : ''}`);
+    // T-R4-5: the debug log is per-chat state (records are what persists with
+    // the chat). Clearing it here is what makes "turn 1, 2, 3…" restart on a
+    // new chat instead of climbing forever.
+    log.clear();
+    log.info('chat', `chat changed — pending state cleared, log reset${droppedOnSwitch ? ` (dropped a pending ${droppedOnSwitch})` : ''}`);
     // F11 / R2-21: migrateChat was DEAD WIRING — records written by other
     // schema versions were never migrated on load. Run it here, guarded: a
     // dry run first (it changes nothing), then the real pass only if needed.
@@ -1802,11 +1973,8 @@ function installPanel() {
             </div>
             <div class="inline-drawer-content">
                 <div class="copilot-head">
-                    <button type="button" data-act="copy" title="Copy the whole debug log (unredacted copy is trimmed only by the clipboard) to the clipboard.">Copy log</button>
-                    <button type="button" data-act="clear" title="Empty the on-screen log. Nothing stored with the chat is touched.">Clear</button>
                     <button type="button" data-act="toggle" title="Enable or disable the extension. Disabled = no extractor/composer calls, no injection. The pilot light turns red.">Toggle</button>
                 </div>
-                <pre class="copilot-body"></pre>
                 <div class="copilot-goals"></div>
                 <div class="copilot-presets"></div>
                 <div class="copilot-spend"></div>
@@ -1815,6 +1983,16 @@ function installPanel() {
                 <div class="copilot-transfer"></div>
                 <div class="copilot-settings"></div>
                 <div class="copilot-records"></div>
+                <div class="copilot-log">
+                    <div class="copilot-gr-head" title="Per-turn diagnostics: models, timings, prompt sizes, failures — for THIS chat only (the log resets on a chat change). Copy gives the plain text."><strong>debug log</strong>
+                        <em class="copilot-spend-note">this chat's turns — formatted for reading; copy gives the plain text</em>
+                    </div>
+                    <div class="copilot-head">
+                        <button type="button" data-act="copy" title="Copy the whole debug log (unredacted copy is trimmed only by the clipboard) to the clipboard.">Copy log</button>
+                        <button type="button" data-act="clear" title="Empty the on-screen log. Nothing stored with the chat is touched.">Clear</button>
+                    </div>
+                    <pre class="copilot-body"></pre>
+                </div>
             </div>
         </div>`;
     const host = document.getElementById('extensions_settings2')
@@ -1830,8 +2008,19 @@ function installPanel() {
     // visible on install; ST's own handler owns the accordion from there.
 
     const body = panel.querySelector('.copilot-body');
+    // T-R4-5 (user request): the DISPLAY is formatted — turn headers separated,
+    // failures in red, section labels bold. The Copy button keeps giving the
+    // plain text (the audit artifact, I7).
     const render = () => {
-        body.textContent = log.toText({ maxPerLine: 400 });
+        const lines = log.toText({ maxPerLine: 400 }).split('\n');
+        body.innerHTML = lines.map((line) => {
+            const cls = /^── turn /.test(line) ? ' copilot-log-line-turn'
+                : /FAILURES/.test(line) ? ' copilot-log-line-fail'
+                    : /^(copilot debug log|events:)/.test(line) ? ' copilot-log-line-meta'
+                        : /^ {2}[a-z][a-z -]*:/.test(line) ? ' copilot-log-line-label'
+                            : '';
+            return `<span class="copilot-log-line${cls}">${escapeHtml(line) || '&nbsp;'}</span>`;
+        }).join('');
     };
 
     // ---- Pilot light (user report: "add a pilot light that shows if it's
@@ -2077,22 +2266,43 @@ function installPanel() {
     const renderCompress = () => {
         try {
             const s = settings();
-            const entries = collectExtractions(ctx().chat ?? []);
+            const list = ctx().chat ?? [];
+            // T-R4-9 (user report): only the CURRENT swipe's facts belong here —
+            // merging facts from other swipes mixes realities. Facts already
+            // compressed away stay visible as history, marked 📦, without a
+            // checkbox (they are already folded).
+            const entries = collectExtractions(list, { currentSwipeOnly: true });
+            const visibleIds = new Set(entries.map((e) => e.extraction.id));
+            const folded = listRecords(list)
+                .filter((e) => e.isCurrentSwipe)
+                .flatMap((e) => [
+                    ...(e.record.extraction ? [{ extraction: e.record.extraction, messageIndex: e.messageIndex, swipeIndex: e.swipeIndex }] : []),
+                    ...(Array.isArray(e.record.extractions) ? e.record.extractions.filter(Boolean).map((x) => ({ extraction: x, messageIndex: e.messageIndex, swipeIndex: e.swipeIndex })) : []),
+                ])
+                .filter((e) => (isCompressedAway(e.extraction) || e.extraction.sources?.length) && !visibleIds.has(e.extraction.id));
+            const row = (e, tickable) => {
+                const box = (isCompressedAway(e.extraction) || e.extraction.sources?.length) ? '📦 ' : '';
+                return `
+                    <div class="copilot-gr-item" data-cidx="${e.extraction.id}" title="extraction ${escapeHtml(String(e.extraction.id))} from message ${e.messageIndex}.${e.swipeIndex}">
+                        ${tickable
+                            ? `<label title="Tick to include in a compression. Only a contiguous run of ticks can be merged."><input type="checkbox" data-csel="${e.extraction.id}" /> ${box}#${e.messageIndex}.${e.swipeIndex}</label>`
+                            : `<span class="copilot-c-text">${box}#${e.messageIndex}.${e.swipeIndex} (compressed)</span>`}
+                        <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
+                        <button type="button" data-act="view-extraction" data-ext-id="${e.extraction.id}" title="Open the FULL extraction in a popup — readable and editable. Save rewrites it and flags the note stale.">View/Edit</button>
+                        ${tickable ? `
+                        <button type="button" data-act="toggle-pin" data-ext-id="${e.extraction.id}" title="Pin = this fact can NEVER be merged away. Unpin to allow merging again.">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
+                        <button type="button" data-act="toggle-protect" data-ext-id="${e.extraction.id}" title="Protect = automatic merges skip this fact. Manual 'Compress selected' can still merge it.">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>` : ''}
+                    </div>`;
+            };
             compressEl.innerHTML = `
                 <div class="copilot-gr-head" title="When the visible fact list grows long, this merges old facts into one short block. The originals are never deleted — they are folded into history and stay auditable (I1/I2)."><strong>compressor</strong>
-                    <em class="copilot-spend-note">merge a contiguous range; originals are kept and hidden (I1/I2)</em>
+                    <em class="copilot-spend-note">current swipe only; 📦 = already compressed; merge a contiguous range (I1/I2)</em>
                 </div>
                 <div class="copilot-gr-add">
                     <button type="button" data-act="compress-run" title="Merge the facts ticked below into one. Only a CONTIGUOUS ticked range can be merged.">Compress selected</button>
                     <button type="button" data-act="compress-undo" title="Put the last merge back: the merged block is removed and its originals become visible again.">Undo last compression</button>
                 </div>
-                ${entries.map((e) => `
-                    <div class="copilot-gr-item" data-cidx="${e.extraction.id}" title="extraction ${escapeHtml(String(e.extraction.id))} from message ${e.messageIndex}.${e.swipeIndex}">
-                        <label title="Tick to include in a compression. Only a contiguous run of ticks can be merged."><input type="checkbox" data-csel="${e.extraction.id}" /> #${e.messageIndex}.${e.swipeIndex}</label>
-                        <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
-                        <button type="button" data-act="toggle-pin" data-ext-id="${e.extraction.id}" title="Pin = this fact can NEVER be merged away. Unpin to allow merging again.">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
-                        <button type="button" data-act="toggle-protect" data-ext-id="${e.extraction.id}" title="Protect = automatic merges skip this fact. Manual 'Compress selected' can still merge it.">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
-                    </div>`).join('')}
+                ${[...entries.map((e) => row(e, true)), ...folded.map((e) => row(e, false))].join('')}
                 <div class="copilot-gr-add">
                     <label title="Auto-compress (default OFF — the G2 review gates enabling it by default): when more facts exist than the threshold below, the oldest usable run is merged automatically"><input type="checkbox" data-cset="auto"${s.compress?.auto ? ' checked' : ''} /> auto-compress</label>
                     <label title="Merge only when MORE than this many extractions are visible">merge above <input type="text" data-cset="maxVisible" value="${escapeHtml(String(s.compress?.maxVisible ?? 40))}" size="4" title="visible-extractions threshold (default 40)" /></label>
@@ -2134,6 +2344,8 @@ function installPanel() {
             const auto = Boolean(compressEl.querySelector('[data-cset="auto"]')?.checked);
             saveSettings({ compress: { auto, maxVisible: val('maxVisible') || 40, mergeCount: val('mergeCount') || 10 } });
             log.info('compress', `settings saved: auto=${auto} maxVisible=${val('maxVisible')} mergeCount=${val('mergeCount')}`);
+        } else if (act === 'view-extraction') {
+            await viewExtraction(String(btn.dataset.extId ?? ''));
         } else if (act === 'toggle-pin' || act === 'toggle-protect') {
             toggleEntryFlag(String(btn.dataset.extId ?? ''), act === 'toggle-pin' ? 'pinned' : 'protected');
         } else if (act === 'restore-snap') {
@@ -2317,6 +2529,18 @@ established so far — light, weather, sound, distance between people. State it 
 established fact, not as an instruction to generate feeling. Then the facts.`),
         },
     ];
+    // Shipped bundles + the user's own saved ones (values prefixed `custom:` so
+    // the two lists can never collide).
+    const templateById = (id, s) => {
+        const v = String(id ?? 'default');
+        if (v.startsWith('custom:')) {
+            const t = (s.customTemplates ?? []).find((x) => x.id === v.slice(7));
+            return t
+                ? { id: v, name: `${t.name} (yours)`, description: t.description || 'your own saved template', extractor: t.extractor, composer: t.composer, compressor: t.compressor }
+                : null;
+        }
+        return PREMADE_TEMPLATES.find((t) => t.id === v) ?? null;
+    };
     const settingsEl = panel.querySelector('.copilot-settings');
     const renderSettings = () => {
         try {
@@ -2345,6 +2569,20 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                     <label title="Comma-separated model ids for merging old facts. Blank = the extractor chain.">compressor chain <input type="text" data-set="compressorChain" title="e.g. inclusionai/ling-3.0-flash" /></label>
                     <label title="Sampling temperature per role. Extractor should stay low; composer higher.">temp extractor / composer <input type="text" data-set="extractorTemp" size="4" title="extractor temperature (0.2 default)" /> <input type="text" data-set="composerTemp" size="4" title="composer temperature (0.7 default)" /></label>
                     <label title="Response token caps per role. Empty = automatic per-model budgets.">tokens extractor / composer <input type="text" data-set="extractorMaxTokens" size="6" title="empty = automatic per-model budget" /> <input type="text" data-set="composerMaxTokens" size="6" title="empty = automatic per-model budget" /></label>
+                    <label title="Reasoning (thinking) effort for models that support it — sent as reasoning.effort. 'none' sends nothing, so non-reasoning models are untouched. A thinking model that burns its whole budget on reasoning can also be kept at 'low' so it actually answers.">reasoning ext / composer
+                        <select data-set="extractorReasoning" title="extractor reasoning effort">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                        <select data-set="composerReasoning" title="composer reasoning effort">
+                            <option value="none">none</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    </label>
                     <label title="How many RECENT messages each role may read (the transcripts are counted in messages, not characters).">recent messages ext / comp <input type="text" data-set="extractorMaxMessages" size="4" title="extractor: how many recent messages (default 12)" /> <input type="text" data-set="composerMaxMessages" size="4" title="composer: how many recent messages (default 20)" /></label>
                     <label title="Safety caps on the total transcript characters sent. Usually leave as-is.">safety chars ext / comp <input type="text" data-set="extractorMaxChars" size="5" title="safety cap, characters" /> <input type="text" data-set="composerMaxChars" size="5" title="safety cap, characters" /></label>
                     <label title="Note length bounds. The minimum is a garbage floor (1-2 word answers are rejected); the maximum is hard.">note words min / max <input type="text" data-set="minWords" size="4" title="soft minimum — short real notes are accepted (default 15)" /> <input type="text" data-set="maxWords" size="4" title="hard maximum (default 120)" /></label>
@@ -2379,7 +2617,8 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                     at the configured position/depth/role above — on chat-completions via ST's extension-prompt registry.</p>
                     <p><strong>Prompts can mention</strong> (namespaced blocks — they never collide with ST's own macros):</p>
                     <ul>
-                        <li><code>{{copilot.extractions}}</code> — the durable facts recorded so far</li>
+                        <li><code>{{copilot.extractions}}</code> — the current story state (facts with their places and times)</li>
+                        <li><code>{{copilot.previousState}}</code> / <code>{{copilot.lastMessages}}</code> — extractor template: the state so far and the NEW messages to fold into it</li>
                         <li><code>{{copilot.lastMessages}}</code> — the recent transcript window</li>
                         <li><code>{{copilot.lorebook}}</code> — triggered + permanently-triggered lorebook entries</li>
                         <li><code>{{copilot.characterCard}}</code>, <code>{{copilot.narratorPrompt}}</code> — the character name and the narrator's standing instructions</li>
@@ -2392,13 +2631,25 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                 </details>
                 <details open><summary>prompt templates (pre-filled with the active templates)</summary>
                     <div class="copilot-tpl-row">
-                        <label title="Ready-made bundles of the three templates below. Loading one only fills the boxes — press Save settings to actually apply it.">premade templates
-                            <select data-set="templatePick" title="Pick a bundle, then press 'Load into boxes'. Nothing changes until you press Save settings.">
-                                ${PREMADE_TEMPLATES.map((t) => `<option value="${escapeHtml(t.id)}"${(keep.templatePick ?? 'default') === t.id ? ' selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
-                            </select>
+                        <div class="copilot-tpl-line">
+                            <label title="Template bundles: the shipped ones plus any you saved. Loading one only fills the boxes below — press Save settings to actually apply it.">template
+                                <select data-set="templatePick" title="Pick a bundle, then press 'Load into boxes'. Nothing changes until you press Save settings.">
+                                    ${[
+                                        ...PREMADE_TEMPLATES.map((t) => ({ value: t.id, name: t.name })),
+                                        ...(s.customTemplates ?? []).map((t) => ({ value: `custom:${t.id}`, name: `${t.name} (yours)` })),
+                                    ].map((o) => `<option value="${escapeHtml(o.value)}"${(keep.templatePick ?? 'default') === o.value ? ' selected' : ''}>${escapeHtml(o.name)}</option>`).join('')}
+                                </select>
+                            </label>
                             <button type="button" data-act="template-load" title="Fill the three template boxes below with the selected bundle. Review or edit them, then press Save settings.">Load into boxes</button>
-                        </label>
-                        <div class="copilot-tpl-desc" title="What this bundle is for.">${escapeHtml(PREMADE_TEMPLATES.find((t) => t.id === (keep.templatePick ?? 'default'))?.description ?? PREMADE_TEMPLATES[0].description)}</div>
+                            <button type="button" data-act="template-save" title="Save the CURRENT contents of the three boxes as your own template, under the name on the next line.">Save current as template</button>
+                            <button type="button" data-act="template-delete" title="Delete the selected template. Only YOUR saved templates can be deleted — the shipped ones stay.">Delete template</button>
+                        </div>
+                        <div class="copilot-tpl-line">
+                            <label title="The name used when you press 'Save current as template'.">template name
+                                <input type="text" data-set="templateName" title="e.g. my slow-burn style" />
+                            </label>
+                        </div>
+                        <div class="copilot-tpl-desc" title="What the selected template is for.">${escapeHtml(templateById(keep.templatePick ?? 'default', s)?.description ?? PREMADE_TEMPLATES[0].description)}</div>
                     </div>
                     <label>extractor <textarea data-set="promptExtractor" rows="6" title="What the fact recorder sees. The transcript is appended as the user turn."></textarea></label>
                     <label>composer <textarea data-set="promptComposer" rows="6" title="What the note writer sees. Use the {{copilot.*}} blocks above."></textarea></label>
@@ -2448,19 +2699,21 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
             put('promptExtractor', s.extractor?.prompt ?? DEFAULT_EXTRACTOR_PROMPT);
             put('promptComposer', s.composer?.prompt ?? DEFAULT_COMPOSER_PROMPT);
             put('promptCompressor', s.compressorPrompt ?? DEFAULT_COMPRESSOR_PROMPT);
+            put('extractorReasoning', s.extractor?.reasoning ?? 'none');
+            put('composerReasoning', s.composer?.reasoning ?? 'none');
         } catch (err) {
             settingsEl.textContent = `settings unavailable: ${redact(String(err?.message ?? err))}`;
         }
     };
     settingsEl.addEventListener('click', (ev) => {
-        const btn = ev.target.closest?.('button[data-act="settings-save"], button[data-act="settings-clear-key"], button[data-act="settings-defaults"], button[data-act="template-load"]');
+        const btn = ev.target.closest?.('button[data-act="settings-save"], button[data-act="settings-clear-key"], button[data-act="settings-defaults"], button[data-act="template-load"], button[data-act="template-save"], button[data-act="template-delete"]');
         if (!btn) {
             return;
         }
-        // Premade template bundle -> fill the boxes (NOT saved yet).
+        // Template bundle -> fill the boxes (NOT saved yet).
         if (btn.dataset.act === 'template-load') {
             const id = String(settingsEl.querySelector('[data-set="templatePick"]')?.value ?? 'default');
-            const tpl = PREMADE_TEMPLATES.find((t) => t.id === id) ?? PREMADE_TEMPLATES[0];
+            const tpl = templateById(id, settings()) ?? PREMADE_TEMPLATES[0];
             const box = (name, v) => {
                 const el = settingsEl.querySelector(`[data-set="${name}"]`);
                 if (el) {
@@ -2471,6 +2724,47 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
             box('promptComposer', tpl.composer ?? DEFAULT_COMPOSER_PROMPT);
             box('promptCompressor', tpl.compressor ?? DEFAULT_COMPRESSOR_PROMPT);
             log.info('settings', `template "${tpl.name}" loaded into the boxes — press Save settings to apply it`);
+            render();
+            return;
+        }
+        // Save the CURRENT boxes as the user's own template (T-R4-5).
+        if (btn.dataset.act === 'template-save') {
+            const name = String(settingsEl.querySelector('[data-set="templateName"]')?.value ?? '').trim();
+            const getBox = (n) => String(settingsEl.querySelector(`[data-set="${n}"]`)?.value ?? '');
+            if (!name) {
+                log.warn('settings', 'give the template a name first — type it in the "template name" field');
+                render();
+                return;
+            }
+            const s0 = settings();
+            saveSettings({
+                customTemplates: [...(s0.customTemplates ?? []), {
+                    id: `tpl_${Date.now().toString(36)}`,
+                    name: name.slice(0, 60),
+                    description: 'your own saved template',
+                    extractor: getBox('promptExtractor') || DEFAULT_EXTRACTOR_PROMPT,
+                    composer: getBox('promptComposer') || DEFAULT_COMPOSER_PROMPT,
+                    compressor: getBox('promptCompressor') || DEFAULT_COMPRESSOR_PROMPT,
+                }],
+            });
+            log.info('settings', `template "${name.slice(0, 60)}" saved from the current boxes — it is now in the template list`);
+            renderSettings();
+            renderPilot();
+            render();
+            return;
+        }
+        if (btn.dataset.act === 'template-delete') {
+            const id = String(settingsEl.querySelector('[data-set="templatePick"]')?.value ?? '');
+            const s0 = settings();
+            if (!id.startsWith('custom:')) {
+                log.warn('settings', 'shipped templates cannot be deleted — select one of yours in the list first');
+                render();
+                return;
+            }
+            const cid = id.slice(7);
+            saveSettings({ customTemplates: (s0.customTemplates ?? []).filter((x) => x.id !== cid) });
+            log.info('settings', 'your template deleted (the shipped templates are untouched)');
+            renderSettings();
             render();
             return;
         }
@@ -2523,6 +2817,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                     // m2: an EMPTY box means "use the built-in template" — the
                     // old `? :` silently kept the previous prompt (trap 10).
                     prompt: get('promptExtractor') || undefined,
+                    reasoning: get('extractorReasoning') || 'none',
                 },
                 composer: {
                     ...s.composer,
@@ -2534,6 +2829,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                     maxChars: num(get('composerMaxChars'), 8000),
                     maxMessages: num(get('composerMaxMessages'), 20),
                     prompt: get('promptComposer') || undefined,
+                    reasoning: get('composerReasoning') || 'none',
                 },
                 injection: {
                     ...s.injection,
@@ -2560,7 +2856,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
         if (ev.target?.dataset?.set !== 'templatePick') {
             return;
         }
-        const tpl = PREMADE_TEMPLATES.find((t) => t.id === String(ev.target.value));
+        const tpl = templateById(String(ev.target.value), settings());
         const desc = settingsEl.querySelector('.copilot-tpl-desc');
         if (tpl && desc) {
             desc.textContent = tpl.description;
@@ -2594,32 +2890,53 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
             // loss; an honest size line is not.
             const totalBytes = entries.reduce((n, e) => n + JSON.stringify(e.record ?? {}).length, 0);
             const sizeLine = `<div class="copilot-record-empty" title="One card per message/swipe that has copilot data. Record sizes are always reported — never silently capped.">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</div>`;
-            recordsEl.innerHTML = sizeLine + entries.map((e, i) => {
+            // T-R4-10 (user layout): every swipe folds INSIDE its message —
+            // "message {n}" is the outer fold, one fold per swipe beneath it.
+            const byMessage = new Map();
+            for (const e of entries) {
+                if (!byMessage.has(e.messageIndex)) {
+                    byMessage.set(e.messageIndex, []);
+                }
+                byMessage.get(e.messageIndex).push(e);
+            }
+            const swipeFold = (e) => {
                 const rec = e.record;
                 const stale = rec.composer?.staleFlag === true;
+                const tr = rec.trace ?? {};
+                const noInput = '(no input recorded for this turn)';
                 return `
-                <div class="copilot-record" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}" title="Stored copilot record for message ${e.messageIndex}, swipe ${e.swipeIndex}. Kept in the chat file.">
-                    <div class="copilot-record-head">
-                        <strong>message ${e.messageIndex} · swipe ${e.swipeIndex}</strong>
-                        ${i === latestIdx && latestAt > 0 ? '<em class="copilot-badge copilot-badge-latest" title="The most recently injected note in this chat.">last injected note</em>' : ''}
+                <details class="copilot-fold copilot-swipe" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
+                    <summary title="Copilot record for message ${e.messageIndex}, swipe ${e.swipeIndex} — kept in the chat file. Click to open."><em class="copilot-badge">swipe ${e.swipeIndex}</em>
                         ${e.isCurrentSwipe ? '<em class="copilot-badge" title="This record belongs to the swipe currently shown in the chat.">current swipe</em>' : ''}
+                        ${e.entriesIdx === latestIdx && latestAt > 0 ? '<em class="copilot-badge copilot-badge-latest" title="The most recently injected note in this chat.">last injected note</em>' : ''}
                         ${rec.composer?.edited ? '<em class="copilot-badge" title="The note was hand-edited in this panel.">note edited</em>' : ''}
                         ${rec.extraction?.edited ? '<em class="copilot-badge" title="The extraction was hand-edited in this panel.">extraction edited</em>' : ''}
                         ${stale ? `<em class="copilot-warn" title="The extraction changed after this note was written, so the note may not match it any more.">⚠ ${escapeHtml(rec.composer.staleReason ?? 'extraction changed, may not match')}</em>` : ''}
-                    </div>
-                    <label title="The durable facts the extractor recorded from this turn. Editing it flags the note as possibly stale.">extraction</label>
-                    <textarea data-field="extraction" rows="3" title="Extracted facts for this turn. Edit and press Save extraction to keep the change.">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
-                    <button type="button" data-act="save-extraction" title="Store this edited extraction. The matching note is flagged as possibly stale.">Save extraction</button>
-                    <label title="The &lt;copilot&gt; guidance note that was injected into the narrator's prompt for this turn.">composer note</label>
-                    <textarea data-field="composer" rows="3" title="The guidance note written by the composer. Edit and press Save note to keep the change.">${escapeHtml(rec.composer?.text ?? '')}</textarea>
-                    <button type="button" data-act="save-note" title="Store this edited note. Nothing already sent to the model changes.">Save note</button>
-                    ${rec.trace ? `
-                    <details class="copilot-trace"><summary title="The exact text sent to and returned from the models for this turn, so you can audit what happened.">audit trace — what was actually sent (survives reloads)</summary>
-                        <label title="The prompt text the extractor model received.">extractor input</label><pre>${escapeHtml(String(rec.trace.extractorIn ?? ''))}</pre>
-                        <label title="The raw extractor model response.">extractor output</label><pre>${escapeHtml(String(rec.trace.extractorOut ?? ''))}</pre>
-                        <label title="The prompt text the composer model received.">composer input</label><pre>${escapeHtml(String(rec.trace.composerIn ?? ''))}</pre>
-                        <label title="The raw composer model response.">composer output</label><pre>${escapeHtml(String(rec.trace.composerOut ?? ''))}</pre>
-                    </details>` : ''}
+                    </summary>
+                        <details class="copilot-fold"><summary>extraction</summary>
+                            <label title="The exact prompt text the extractor model received.">input</label>
+                            <pre>${escapeHtml(String(tr.extractorIn ?? noInput))}</pre>
+                            <label title="The durable facts the extractor recorded from this turn. Editing it flags the note as possibly stale.">output</label>
+                            <textarea data-field="extraction" rows="3" title="Extracted facts for this turn. Edit and press Save extraction to keep the change.">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
+                            <button type="button" data-act="save-extraction" title="Store this edited extraction. The matching note is flagged as possibly stale.">Save extraction</button>
+                        </details>
+                        <details class="copilot-fold"><summary>copilot</summary>
+                            <label title="The exact prompt text the composer model received.">input</label>
+                            <pre>${escapeHtml(String(tr.composerIn ?? noInput))}</pre>
+                            <label title="The &lt;copilot&gt; guidance note that was injected into the narrator's prompt for this turn.">output</label>
+                            <textarea data-field="composer" rows="3" title="The guidance note written by the composer. Edit and press Save note to keep the change.">${escapeHtml(rec.composer?.text ?? '')}</textarea>
+                            <button type="button" data-act="save-note" title="Store this edited note. Nothing already sent to the model changes.">Save note</button>
+                        </details>
+                </details>`;
+            };
+            recordsEl.innerHTML = sizeLine + [...byMessage.entries()].map(([mi, swipes]) => {
+                return `
+                <div class="copilot-record" data-msg="${mi}">
+                    <details><summary title="Stored copilot records for message ${mi} — one fold per swipe. Click to open."><strong>message ${mi}</strong>
+                        <em class="copilot-badge">${swipes.length} swipe${swipes.length === 1 ? '' : 's'}</em>
+                    </summary>
+                        ${swipes.map((e) => swipeFold({ ...e, entriesIdx: entries.indexOf(e) })).join('')}
+                    </details>
                 </div>`;
             }).join('');
         } catch (err) {
@@ -2632,7 +2949,9 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
         if (!btn) {
             return;
         }
-        const card = btn.closest('.copilot-record');
+        // T-R4-10: the swipe fold carries the coordinates now (swipes live
+        // inside their message fold).
+        const card = btn.closest('.copilot-swipe[data-mi][data-si]');
         if (!card) {
             return;
         }
@@ -2721,7 +3040,7 @@ function init() {
     es.on(EVENT.CHAT_COMPLETION_PROMPT_READY, (data) => onPromptReady(data, EVENT.CHAT_COMPLETION_PROMPT_READY));
     es.on(EVENT.GENERATE_AFTER_COMBINE_PROMPTS, (data) => onPromptReady(data, EVENT.GENERATE_AFTER_COMBINE_PROMPTS));
     es.on(EVENT.MESSAGE_RECEIVED, () => onMessageReceived());
-    es.on(EVENT.CHAT_CHANGED, () => onChatChanged());
+    es.on(EVENT.CHAT_CHANGED, (chatId) => onChatChanged(chatId));
     es.on(EVENT.WORLD_INFO_ACTIVATED, (entries) => onWorldInfoActivated(entries));
     // R3-F6/F15 (and m4): a turn can end WITHOUT MESSAGE_RECEIVED (aborts;
     // onErrorStreaming deliberately skips it for some types). The latch must
@@ -2740,6 +3059,17 @@ function init() {
     // recovery mirror (lastBoundRecord) is re-checked at every GENERATION_STARTED.
     es.on(EVENT.MESSAGE_DELETED, () => {
         log.info('store', 'message deleted — the last-bound mirror will recover its record if the next turn needs it');
+    });
+    // T-R4-10 (user report): swiping BACK to an earlier swipe happens without a
+    // generation, so nothing re-rendered and the "current swipe" badge stayed
+    // on the last-rendered swipe ("swiped 4 times and returned to swipe 2 — the
+    // current swipe will still be on swipe 4"). These log lines both record the
+    // event and drive the panel's re-render through the log subscriber.
+    es.on(EVENT.MESSAGE_SWIPED, () => {
+        log.info('store', 'swipe changed — records view refreshed for the current swipe');
+    });
+    es.on(EVENT.MESSAGE_EDITED, () => {
+        log.info('store', 'message edited — records view refreshed');
     });
 
     installWatcher();

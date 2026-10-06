@@ -27,7 +27,7 @@ import { redact } from './redact.js';
  * Changes on every build of this file. Bump it when shipping a change whose
  * effect you need to be able to confirm from a pasted log.
  */
-export const BUILD_ID = 'copilot-phase8-r4';
+export const BUILD_ID = 'copilot-phase8-r5';
 
 const MAX_EVENTS = 500;
 
@@ -150,9 +150,16 @@ export class DebugLog {
         push(`copilot debug log — build ${this.buildId}`);
         push(`events: ${this.events.length}, turns: ${this.turns.size}, failures: ${failures}`);
         lines.push('');
+        // T-R4-5 (user report: "── turn 7:1 ── even after a reset the turn
+        // continues increasing"): the header used to print the raw id
+        // (`chatSeq:token`), whose first number climbs for the whole session.
+        // Turns are numbered SEQUENTIALLY in display order — restarting
+        // whenever the log is cleared or the chat changes.
+        let turnNo = 0;
         for (const t of this.turns.values()) {
+            turnNo += 1;
             const totalMs = (t.finishedAt ?? this.now()) - t.startedAt;
-            push(`── turn ${t.id} ──`);
+            push(`── turn ${turnNo} ──`);
             push(`  timings: total=${totalMs}ms${t.pipelineMs !== null ? ` pipeline=${t.pipelineMs}ms` : ''}`);
             push(`  script-verified injected (found in the outgoing request): ${t.noteFoundOutgoing === null ? 'not verified' : t.noteFoundOutgoing}`);
             push(`  incoming prompt seen: ${t.incomingPromptSeen}`);

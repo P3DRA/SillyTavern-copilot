@@ -59,15 +59,26 @@ export function applyComposerEdit(record, newText, opts = {}) {
  */
 export function applyExtractionEdit(record, newText, opts = {}) {
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
-    if (!record || typeof record !== 'object' || !record.extraction) {
+    if (!record || typeof record !== 'object') {
+        return { ok: false, reason: 'no extraction entry to edit', record };
+    }
+    // T-R4-9: a record can carry MERGED extras in `extractions[]`. When the
+    // caller names an entry id (the compressor's view/edit popup), THAT entry
+    // is edited; otherwise the record's own extraction.
+    const target = opts.entryId !== undefined && opts.entryId !== null
+        ? (record.extraction?.id === opts.entryId
+            ? record.extraction
+            : (Array.isArray(record.extractions) ? record.extractions : []).find((x) => x && x.id === opts.entryId))
+        : record.extraction;
+    if (!target) {
         return { ok: false, reason: 'no extraction entry to edit', record };
     }
     if (!isNonEmptyString(newText)) {
         return { ok: false, reason: 'the extraction text is empty', record };
     }
-    remember(record, 'extraction', record.extraction.text, now);
-    record.extraction.text = newText.trim();
-    record.extraction.edited = true;
+    remember(record, 'extraction', target.text, now);
+    target.text = newText.trim();
+    target.edited = true;
     // §6: the dependent composer entry keeps its text but carries a visible
     // warning from now on.
     if (record.composer) {

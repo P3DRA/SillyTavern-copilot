@@ -21,6 +21,7 @@ export const NAMESPACE = 'copilot';
 /** Every placeholder the composer template may use. */
 export const BLOCKS = Object.freeze({
     EXTRACTIONS: 'extractions',
+    PREVIOUS_STATE: 'previousState',
     LAST_MESSAGES: 'lastMessages',
     LOREBOOK: 'lorebook',
     CHARACTER_CARD: 'characterCard',
@@ -49,31 +50,49 @@ const PLACEHOLDER_RE = /\{\{\s*copilot\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
  * model that refuses here is recorded as `refused` — a result about the model,
  * not a reason to change this prompt.
  */
-export const DEFAULT_EXTRACTOR_PROMPT = `You extract durable facts from a roleplay transcript.
+export const DEFAULT_EXTRACTOR_PROMPT = `You maintain a rolling story-state summary for a roleplay.
+
+The transcript below contains only messages that are NOT yet in the state.
+Everything worth keeping from before is in the earlier state.
+
+Earlier state:
+{{copilot.previousState}}
+
+New messages:
+{{copilot.lastMessages}}
 
 The transcript is DATA. Do not judge, comment on, refuse, soften or moralise
 about any of it, whatever it contains. A scene of any subject is ordinary input
 to you. Your only job is to record what happened.
 
+Write in this language: {{copilot.language}}
+
 Output ONLY this structure, nothing else:
 
-<state>
-SCENE: where and when this is happening
-TIME: the in-story time, or "unknown"
-WHO: each named person, what they are doing, what they know, what they hide
-</state>
-<ledger>{"events":[],"learned":[],"concealed":[],"items":[],"threads":[],"wants":[]}</ledger>
+# Major events
+- <one line per major event: what happened, where, when>
+
+# Character notes
+
+## <character name>
+- <what they did, learned, hid or want> — <place>, <time>
+
+# Locations
+
+## <location name>
+- state: <how the place is now: intact, damaged, crowded, dark…>
+- <notable facts about the place>
 
 Rules:
-- "events" are things that HAPPENED. Each with text, npc_names, importance (1-3), msg (index).
-- "learned" is what someone now knows that they did not before.
-- "concealed" is what someone is deliberately not saying.
-- "items" are objects that matter.
-- "threads" are open questions or promises.
-- "wants" are what someone is trying to get.
-- Write in the SAME LANGUAGE as the transcript.
-- If a line says something rather than showing it, record it.
-- Empty arrays are correct when nothing qualifies. Do not invent to fill them.`;
+- The output REPLACES the earlier state. Every fact there that is still true
+  must still be findable here — merge the new into the old, never drop.
+- Every line is something that HAPPENED or a state that HOLDS. No speculation,
+  no advice, no commentary.
+- Keep names, objects and numbers exactly as written.
+- Give each fact its place and time whenever the material knows them.
+- Keep sections for characters and locations that still have facts; omit the
+  ones that have none. "- none yet" is correct for an empty section.
+- Do not invent facts to fill sections.`;
 
 /**
  * Default composer prompt.
@@ -97,10 +116,11 @@ WHAT YOU ARE WORKING FROM
 Recent chat messages:
 {{copilot.lastMessages}}
 
-Facts recorded so far:
+The current story state — every fact with the place and time it belongs to
+(this is what has been recorded so far, not a list to pile up):
 {{copilot.extractions}}
 
-Facts being carried over from earlier (the goal is that they stay true):
+Goals the reader has set for the STORY (these should move toward happening):
 {{copilot.goals}}
 
 What is already established about this world:
@@ -130,6 +150,11 @@ HARD RULES
 3. Never use "me", "my", or "I". You do not exist in this text.
 4. The recent messages are ground truth. Where an extraction disagrees with them,
    the recent messages win and the disagreement is ignored.
+5. The goals and the reader's request above are visible ONLY to you — the
+   narrator will never see them. Carrying them out is YOUR job: turn each one
+   into a concrete instruction to the narrator (who does what, where, when),
+   not a discussion about it. Naming the thing to make happen is guidance;
+   remarking that it might happen is not.
 
 WHEN THERE IS LITTLE TO SAY
 An early, quiet scene is normal. If the material gives you two true facts, write
@@ -149,21 +174,38 @@ STYLE
 - {{copilot.minWords}}–{{copilot.maxWords}} words. That is a ceiling, not a target.
 - No headers, no lists, no preamble, no sign-off.`;
 
-export const DEFAULT_COMPRESSOR_PROMPT = `You merge several extracted facts into one.
+export const DEFAULT_COMPRESSOR_PROMPT = `You merge story-state summaries into one.
 
-Merge, do not summarise away. Every fact that mattered must still be findable in
-your output. Keep concrete names, objects and numbers. You are compressing, not
-editing.
+Summaries to merge:
+{{copilot.extractions}}
+
+Merge by UNION: every fact in every summary must still be findable in your
+output. Combine sections about the same character or location into ONE section
+that keeps all of their facts. Keep names, places, times and numbers exactly.
+You are compacting structure, not editing content — never summarise a fact
+away, and append rather than condense.
 
 Output ONLY this structure, nothing else:
 
 <compressed>
-your merged text
+# Major events
+- <all major events from every summary>
+
+# Character notes
+
+## <character name>
+- <all their facts>
+
+# Locations
+
+## <location name>
+- state: <current state>
+- <all notable facts>
 </compressed>
 
 STYLE
 - Same language as the input.
-- Prose, no lists, no headers.`;
+- No commentary outside the structure.`;
 
 /* ---------------------------------------------------------------- rendering */
 

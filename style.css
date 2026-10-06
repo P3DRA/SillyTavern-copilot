@@ -16,6 +16,27 @@
     overflow-wrap: anywhere;
 }
 
+/* Every button in the panel uses the THEME's own readable colour pair
+   (body text on blur tint — the same combination ST styles its own controls
+   with). User report: "the text of the button 'Load into boxes' being light
+   grey blends in the button white colour" — `color: inherit` on a transparent
+   background produced exactly that on light themes. */
+.copilot-panel button {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    cursor: pointer;
+    color: var(--SmartThemeBodyColor, #ddd);
+    background-color: var(--SmartThemeBlurTintColor, rgba(127, 127, 127, 0.25));
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 3px;
+}
+
+.copilot-panel button:hover {
+    filter: brightness(1.15);
+}
+
 .copilot-panel .inline-drawer-header {
     display: flex;
     align-items: center;
@@ -79,17 +100,18 @@
 }
 
 .copilot-head button {
+    /* Colours come from the shared .copilot-panel button rule (theme pair). */
     font-size: 11px;
-    padding: 1px 8px;
+    padding: 2px 8px;
     cursor: pointer;
-    background: transparent;
-    color: inherit;
     border: 1px solid var(--SmartThemeBorderColor, #555);
     border-radius: 3px;
 }
 
-.copilot-head button:hover {
-    background: rgba(255, 255, 255, 0.08);
+/* ---- The debug log (moved to the BOTTOM of the panel — user request) ---- */
+.copilot-log {
+    border-top: 1px solid var(--SmartThemeBorderColor, #444);
+    padding: 6px 8px;
 }
 
 .copilot-body {
@@ -101,24 +123,83 @@
     word-break: break-word;
     line-height: 1.45;
     font-size: 11px;
-    opacity: 0.9;
     background: rgba(0, 0, 0, 0.2);
     border-radius: 4px;
 }
 
-/* ---- The log browser (phase 3): ONE card layout, repeated per message/swipe. */
+/* Readable log lines (user request: "format the entries to make them more
+   readable") — the plain text copy is unchanged; only the DISPLAY is styled. */
+.copilot-log-line {
+    display: block;
+}
+
+.copilot-log-line-turn {
+    font-weight: 700;
+    color: #7fd67f;
+    margin-top: 8px;
+    border-bottom: 1px solid rgba(127, 214, 127, 0.35);
+}
+
+.copilot-log-line-meta {
+    opacity: 0.65;
+}
+
+.copilot-log-line-fail {
+    color: #ff8b8b;
+    font-weight: 600;
+}
+
+.copilot-log-line-label {
+    opacity: 0.85;
+    font-weight: 600;
+}
+
+/* ---- The log browser (phase 3): ONE card layout, repeated per message/swipe,
+   folded (T-R4-5: message > extraction > input/output, copilot > input/output). */
 .copilot-records {
     border-top: 1px solid var(--SmartThemeBorderColor, #444);
     overflow-y: auto;
-    max-height: 24vh;
+    max-height: 40vh;
     padding: 6px 8px;
 }
 
 .copilot-record {
     border: 1px solid var(--SmartThemeBorderColor, #444);
     border-radius: 4px;
-    padding: 6px;
-    margin-bottom: 8px;
+    padding: 4px 6px;
+    margin-bottom: 6px;
+}
+
+/* Folded nesting: each level indents — the tree the user drew. */
+.copilot-fold {
+    margin: 2px 0 2px 10px;
+    border-left: 2px solid rgba(127, 127, 127, 0.35);
+    padding-left: 6px;
+}
+
+.copilot-fold > summary {
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    opacity: 0.9;
+    user-select: none;
+}
+
+.copilot-fold pre {
+    margin: 2px 0;
+    padding: 4px 6px;
+    max-height: 22vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 11px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 3px;
+}
+
+.copilot-record summary {
+    cursor: pointer;
+    user-select: none;
 }
 
 .copilot-record-head {
@@ -166,17 +247,6 @@
 
 .copilot-record button {
     margin-top: 4px;
-    font-size: 11px;
-    padding: 1px 8px;
-    cursor: pointer;
-    background: transparent;
-    color: inherit;
-    border: 1px solid var(--SmartThemeBorderColor, #555);
-    border-radius: 3px;
-}
-
-.copilot-record button:hover {
-    background: rgba(255, 255, 255, 0.08);
 }
 
 .copilot-record-empty {
@@ -321,6 +391,17 @@
     white-space: normal;
 }
 
+/* One control group per line. T-R4-5: buttons used to sit INSIDE the same
+    <label> as the <select>, and label activation behaviour made button clicks
+    unreliable in some browsers. Each control now stands alone. */
+.copilot-tpl-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 3px 0;
+}
+
 .copilot-tpl-desc {
     margin-top: 3px;
     font-size: 11px;
@@ -375,11 +456,10 @@
 
 .copilot-gr-add button,
 .copilot-gr-item button {
+    /* Colours come from the shared .copilot-panel button rule (theme pair). */
     font-size: 11px;
-    padding: 1px 8px;
+    padding: 2px 8px;
     cursor: pointer;
-    background: transparent;
-    color: inherit;
     border: 1px solid var(--SmartThemeBorderColor, #555);
     border-radius: 3px;
 }

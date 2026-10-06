@@ -128,12 +128,31 @@ export const FAIL = Object.freeze({
  * @param {(event: object) => void} [args.onEvent]  Progress for the debug log.
  * @returns {Promise<object>} attempt record
  */
+/**
+ * T-R4-8: a retry must never be byte-identical (user: "composer was fired twice
+ * with the exact same prompt" — the second call was a retry and carried no
+ * signal about what was wrong). The first retry appends one short correction
+ * line; it is never appended twice.
+ */
+function hintedMessages(args) {
+    const hint = typeof args.retryHint === 'string' ? args.retryHint.trim() : '';
+    if (!hint || args._hinted || !Array.isArray(args.messages)) {
+        return args.messages;
+    }
+    return [...args.messages, { role: 'user', content: hint }];
+}
+
 export async function attempt(args) {
     const {
         model, messages, key, baseUrl = DEFAULT_BASE_URL, fetchImpl = globalThis.fetch,
         temperature = 0.7, tag = null, json = false, signal,
         onEvent = () => {},
     } = args;
+
+    // T-R4-7 (user request): the provider's debug screen should show WHICH
+    // copilot role is calling — "SillyTavern-Copilot-Extractor" etc.
+    const role = typeof args.role === 'string' && args.role.trim() ? args.role.trim() : 'copilot';
+    const title = `SillyTavern-Copilot-${role.charAt(0).toUpperCase()}${role.slice(1)}`;
 
     const started = Date.now();
     const record = {
@@ -169,6 +188,13 @@ export async function attempt(args) {
     if (json) {
         body.response_format = { type: 'json_object' };
     }
+    // T-R4-1 (user request): reasoning effort for models that support it
+    // (OpenRouter's `reasoning: { effort }`). 'none'/unset sends nothing, so
+    // models without reasoning are unaffected.
+    const effort = typeof args.reasoning === 'string' ? args.reasoning.trim().toLowerCase() : '';
+    if (effort && effort !== 'none') {
+        body.reasoning = { effort };
+    }
 
     onEvent({ kind: 'request', model, maxTokens, messages, bodyPreview: redact(JSON.stringify(body)) });
 
@@ -198,8 +224,8 @@ export async function attempt(args) {
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${key}`,
-                'HTTP-Referer': 'SillyTavern Copilot',
-                'X-Title': 'SillyTavern Copilot',
+                'HTTP-Referer': 'https://sillytavern.github.io/SillyTavern-Docs/',
+                'X-Title': title,
             },
             body: JSON.stringify(body),
             signal: effectiveSignal,
@@ -267,7 +293,7 @@ export async function attempt(args) {
             kind: 'reasoning-budget-retry', model, from: maxTokens, to: maxTokens * 4,
             droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
         });
-        const retry = await attempt({ ...args, maxTokens: maxTokens * 4, budgetDepth: (args.budgetDepth ?? 0) + 1 });
+        const retry = await attempt({ ...args, messages: hintedMessages(args), _hinted: true, maxTokens: maxTokens * 4, budgetDepth: (args.budgetDepth ?? 0) + 1 });
         // F5 (critique round 1): the DROPPED attempt consumed real tokens
         // (thinking) — fold its usage into the returned record so spend
         // accounting and the failure log see every cent (it used to vanish).
@@ -289,7 +315,7 @@ export async function attempt(args) {
             kind: 'truncation-budget-retry', model, from: maxTokens, to: maxTokens * 2,
             droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
         });
-        const retry = await attempt({ ...args, maxTokens: maxTokens * 2, budgetDepth: (args.budgetDepth ?? 0) + 1 });
+        const retry = await attempt({ ...args, messages: hintedMessages(args), _hinted: true, maxTokens: maxTokens * 2, budgetDepth: (args.budgetDepth ?? 0) + 1 });
         return {
             ...retry,
             budgetRetried: true,
@@ -340,7 +366,12 @@ export async function callWithFallback(args) {
 
     for (const model of chain) {
         for (let tryIndex = 0; tryIndex <= retries; tryIndex += 1) {
-            const rec = await attempt({ ...args, model });
+            // T-R4-8: retries carry the correction hint (once).
+            const rec = await attempt({
+                ...args,
+                model,
+                ...(tryIndex > 0 ? { messages: hintedMessages(args), _hinted: true } : {}),
+            });
             rec.attemptIndex = tryIndex;
             attempts.push(rec);
             if (rec.ok) {

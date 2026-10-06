@@ -93,10 +93,25 @@ export async function runPipeline(input, deps = {}) {
         }
 
         // ---- 1. Extractor ----
-        const extractWindow = fitMessages(input.messages, settings.extractor?.maxChars ?? 6000);
-        const language = detectLanguage(extractWindow.messages);
+        // T-R4-6 (user redesign, CRITICAL): the extractor is a ROLLING
+        // SUMMARIZER. It receives the previous state plus ONLY the messages not
+        // yet folded into it — re-sending the whole chat every turn was both
+        // wasteful and wrong (and feeding every extraction to the composer just
+        // piles up without bound).
+        const extractSource = (Array.isArray(input.extractMessages) && input.extractMessages.length > 0)
+            ? input.extractMessages
+            : input.messages;
+        const extractWindow = fitMessages(extractSource, settings.extractor?.maxChars ?? 6000);
+        const language = detectLanguage(input.messages);
+        const previousState = String(input.previousState ?? '').trim()
+            || '(none yet — this is the first extraction)';
         const extractorPrompt = render(settings.extractor?.prompt ?? DEFAULT_EXTRACTOR_PROMPT, {
             lastMessages: renderMessages(extractWindow.messages),
+            // The state placeholders: the new template reads previousState, and
+            // older custom templates that said {{copilot.extractions}} still get
+            // the same content instead of an empty block.
+            previousState,
+            extractions: previousState,
             lorebook: input.lorebook ?? '',
             characterCard: input.characterCard ?? '',
             narratorPrompt: input.narratorPrompt ?? '',
@@ -121,6 +136,15 @@ export async function runPipeline(input, deps = {}) {
             ],
             temperature: settings.extractor?.temperature ?? 0.2,
             maxTokens: settings.extractor?.maxTokens,
+            // T-R4-7: the provider debug screen shows WHICH copilot role is
+            // calling ("SillyTavern-Copilot-Extractor"), and reasoning effort is
+            // forwarded for models that support it.
+            role: 'extractor',
+            reasoning: settings.extractor?.reasoning,
+            // T-R4-8: a retry must not be byte-identical (user saw "composer
+            // fired twice with the exact same prompt" — the second call was a
+            // retry and had no way to know what was wrong).
+            retryHint: 'Answer with the state summary in the exact section structure from the prompt — no preamble, no commentary.',
             // The extractor emits a structured, deliberately COMPACT record. The
             // composer's prose word bounds do not apply to it — applying them
             // rejected perfectly good extractions for being short, which is how
@@ -131,12 +155,15 @@ export async function runPipeline(input, deps = {}) {
             onEvent,
         });
         result.attempts.push(...extractResult.attempts);
-        // F14 (critique round 1): the extractor's <state> contract was never
-        // checked at runtime — garbage prose was stored and fed to the composer
-        // as "facts". LENIENT on purpose (§6's garbage rule targets the note):
+        // F14 (critique round 1): the extractor's format contract is checked at
+        // runtime — but LENIENT on purpose (§6's garbage rule targets the note):
         // a missed format is a recorded quality warning, not a hard reject.
-        if (extractResult.ok && extractResult.text && !/<state>[\s\S]*<\/state>/i.test(extractResult.text)) {
-            onEvent({ kind: 'extractor-format-warning', detail: 'no <state> block in the output — stored as-is, format contract missed' });
+        // T-R4-6: the contract is now the state structure (headings), with the
+        // old <state> form accepted for old templates.
+        const stateFormat = /#\s*(major events|character notes|locations)/i.test(extractResult.text ?? '')
+            || /<state>[\s\S]*<\/state>/i.test(extractResult.text ?? '');
+        if (extractResult.ok && extractResult.text && !stateFormat) {
+            onEvent({ kind: 'extractor-format-warning', detail: 'no state sections in the output — stored as-is, format contract missed' });
         }
         const extIn = extractResult.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0);
         const extOut = extractResult.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0);
@@ -197,7 +224,17 @@ export async function runPipeline(input, deps = {}) {
             maxWords: settings.composer?.maxWords ?? LIMITS.MAX_WORDS,
         };
         const composerPrompt = render(settings.composer?.prompt ?? DEFAULT_COMPOSER_PROMPT, {
-            extractions: renderEntries(input.extractions ?? []),
+            // T-R4-6: the composer reads the CURRENT STATE — the fresh state
+            // from this turn (which already contains the earlier facts by
+            // construction), labelled with when it was taken so the composer
+            // knows the timing of events (user report: "extractions come
+            // unlabelled as to when they were taken"). It is NOT handed the
+            // whole extraction pile any more — that grows without bound.
+            extractions: result.extraction.text
+                ? `(state as of this turn — just recorded)\n${result.extraction.text}`
+                : (String(input.previousState ?? '').trim()
+                    ? `(state as of message ${Number(input.previousStateSource ?? 0) + 1})\n${input.previousState}`
+                    : '(no state recorded yet)'),
             lastMessages: renderMessages(composerWindow.messages),
             lorebook: input.lorebook ?? '',
             characterCard: input.characterCard ?? '',
@@ -232,6 +269,9 @@ export async function runPipeline(input, deps = {}) {
             ],
             temperature: settings.composer?.temperature ?? 0.7,
             maxTokens: settings.composer?.maxTokens,
+            role: 'composer',
+            reasoning: settings.composer?.reasoning,
+            retryHint: 'Wrap the guidance note in <copilot> and </copilot> tags and output nothing else — no narration, no preamble.',
             tag: 'copilot',
             minWords: noteBudget.minWords,
             maxWords: noteBudget.maxWords,

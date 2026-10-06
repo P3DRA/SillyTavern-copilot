@@ -360,6 +360,11 @@ export function collectExtractions(chat, opts = {}) {
         if (entry.messageIndex > limit) {
             continue;
         }
+        // T-R4-9: the compressor only makes sense over the swipe the user is
+        // actually on — merging facts from other swipes mixes realities.
+        if (opts.currentSwipeOnly && !entry.isCurrentSwipe) {
+            continue;
+        }
         if (opts.excludeSwipeAt
             && entry.messageIndex === opts.excludeSwipeAt.messageIndex
             && entry.swipeIndex === opts.excludeSwipeAt.swipeIndex) {

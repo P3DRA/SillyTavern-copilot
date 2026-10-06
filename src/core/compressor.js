@@ -227,10 +227,22 @@ export async function compressEntries(chat, entries, indices, deps = {}) {
     // render() returns { text, ... } — the pipeline reads `.text` off it too.
     // `deps.prompt` is the user-editable compress prompt (§6) — wired, not
     // decorative (critique trap-10 class).
-    const promptText = render(deps.prompt || COMPRESS_PROMPT, {
-        extractions: renderEntries(chosen.map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 }))),
-    }).text;
-    const res = await deps.callModel([{ role: 'system', content: promptText }]);
+    const entriesText = renderEntries(chosen.map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 })));
+    const rendered = render(deps.prompt || COMPRESS_PROMPT, { extractions: entriesText });
+    const promptText = rendered.text;
+    // T-R4-3 (user report: "compressor isn't working — nothing is being sent to
+    // be compressed"; the provider log showed the prompt with an EMPTY facts
+    // block and the model reasoning "the user forgot to include the facts"):
+    // the default prompt used to carry NO {{copilot.extractions}} placeholder,
+    // so render() had nowhere to put the facts and they never left the browser.
+    // Never again: if the rendered prompt does not actually CONTAIN the facts,
+    // send them as a second message regardless of what the template did.
+    const factsVisible = rendered.used.includes('extractions') || promptText.includes(entriesText.slice(0, 200));
+    const messages = [{ role: 'system', content: promptText }];
+    if (!factsVisible) {
+        messages.push({ role: 'user', content: `Facts to merge:\n${entriesText}` });
+    }
+    const res = await deps.callModel(messages);
     if (!res || !res.ok) {
         // I4: nothing changes on a failed call either — and the user is told.
         return { ok: false, reason: `compressor call failed: ${res?.reason ?? 'no result'}`, raw: res?.text ?? '' };
