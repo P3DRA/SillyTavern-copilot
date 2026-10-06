@@ -14,6 +14,12 @@ const KEY_PATTERNS = [
     // OpenRouter, both the legacy and the current prefixes.
     /sk-or-v1-[A-Za-z0-9_-]{8,}/g,
     /sk-or-[A-Za-z0-9_-]{8,}/g,
+    // F13 (round 3): the extension accepts ANY provider key (custom baseUrl)
+    // — sk-proj-, sk-ant-, etc. — and query-string key=/token= values.
+    // {20,} and no-ellipsis keep expected-output LITTERALS (like
+    // `key=sk-or-v1-…cdef`) from matching themselves in the repo scan.
+    /\bsk-[A-Za-z0-9_-]{16,}/g,
+    /\b(key|token|api_key|apikey)=([^&\s"'…]{20,})/gi,
     // Anything else that looks like a bearer secret we were asked to hide.
     /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi,
 ];
@@ -77,8 +83,9 @@ export function redact(value) {
         // Patterns are global; reset lastIndex so repeated calls are stable.
         pattern.lastIndex = 0;
         out = out.replace(pattern, (match) => {
-            // Keep a Bearer prefix readable without leaking the token.
-            const m = /^(\s*Bearer\s+)/i.exec(match);
+            // Keep a Bearer prefix or a key=/token= prefix readable without
+            // leaking the value (F13: the whole match used to vanish).
+            const m = /^(\s*Bearer\s+|[\w.-]+=)/i.exec(match);
             const token = m ? match.slice(m[1].length) : match;
             return (m ? m[1] : '') + redactSecret(token);
         });

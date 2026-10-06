@@ -822,16 +822,23 @@ let supersededRecord = null;
  */
 function popupWithTimeout(promise, ms, fallback, label) {
     let timer = null;
+    // F9 (round 3): remember which popups predate this wait — a modal appended
+    // DURING it (another extension's confirm) used to be the one dismissed.
+    const preexisting = new Set([...document.querySelectorAll('.popup')]);
     const timeout = new Promise((resolve) => {
         timer = setTimeout(() => {
             log.warn('popup', `${label} unanswered for ${ms}ms — using the benign default '${fallback}' (trap 7)`);
-            // T-R2-13: the timed-out modal must stop blocking the UI — dismiss
-            // the visible popup (its late answer is discarded; the mappers are
-            // pure, verified by inspection).
+            // T-R2-13: the timed-out modal must stop blocking the UI. Dismiss
+            // OURS — the first popup opened during this wait — using the real
+            // ST button classes (.popup-button-cancel / .popup-button-close;
+            // the old selectors matched nothing in ST's DOM).
             try {
-                const open = [...document.querySelectorAll('.popup')].filter((p) => p.getClientRects().length > 0);
-                const top = open[open.length - 1];
-                top?.querySelector('.popup-button-cancel, .popup-close, .popup-button')?.click();
+                const opened = [...document.querySelectorAll('.popup')]
+                    .filter((p) => p.getClientRects().length > 0 && !preexisting.has(p));
+                const mine = opened[0];
+                (mine?.querySelector('.popup-button-cancel')
+                    || mine?.querySelector('.popup-button-close')
+                    || mine?.querySelector('.popup-button-ok'))?.click();
             } catch { /* best effort */ }
             resolve(fallback);
         }, ms);
@@ -1081,7 +1088,9 @@ const injectedTokens = new Set();
  */
 const TRACE_CAP = 4000;
 function traceBounded(v) {
-    const s = String(v ?? '');
+    // F12: traces are PERSISTED to disk (and copied into exports) — redact
+    // before bounding. A chat-pasted key must never survive in a trace.
+    const s = redact(String(v ?? ''));
     return s.length > TRACE_CAP ? `${s.slice(0, TRACE_CAP)}… [+${s.length - TRACE_CAP} chars]` : s;
 }
 function buildTrace(inputs, extraction, composer) {
@@ -2294,6 +2303,13 @@ function installPanel() {
                     <label>composer note</label>
                     <textarea data-field="composer" rows="3">${escapeHtml(rec.composer?.text ?? '')}</textarea>
                     <button type="button" data-act="save-note">Save note</button>
+                    ${rec.trace ? `
+                    <details class="copilot-trace"><summary>audit trace — what was actually sent (survives reloads)</summary>
+                        <label>extractor input</label><pre>${escapeHtml(String(rec.trace.extractorIn ?? ''))}</pre>
+                        <label>extractor output</label><pre>${escapeHtml(String(rec.trace.extractorOut ?? ''))}</pre>
+                        <label>composer input</label><pre>${escapeHtml(String(rec.trace.composerIn ?? ''))}</pre>
+                        <label>composer output</label><pre>${escapeHtml(String(rec.trace.composerOut ?? ''))}</pre>
+                    </details>` : ''}
                 </div>`;
             }).join('');
         } catch (err) {
@@ -2418,9 +2434,12 @@ function init() {
     refreshSecretKey(); // R2-8: seed the ST-secret cache at boot
 
     // Exposed for the T3 driver and for the user in the console. Never holds a
-    // secret: apiKey() is a function, not a value.
+    // secret: the settings VIEW redacts the key (F14 — it used to return the
+    // plaintext apiKey while this comment claimed otherwise), and apiKey() is
+    // a function, not a value.
     window.copilot = {
-        log, settings, saveSettings, BUILD_ID, runs: [],
+        log, settings: () => ({ ...settings(), apiKey: settings().apiKey ? '[redacted]' : '' }),
+        saveSettings, BUILD_ID, runs: [],
         editNote, editExtraction,
         addGoal, completeGoal, addRequest, removeRequest, tick: tickChatState,
         spendTotals, savePreset, applyPresetById, deletePreset,
