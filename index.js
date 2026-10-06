@@ -28,6 +28,7 @@ import { EVENT, GENERATION_TYPE, NOTE_TAG } from './src/st/constants.js';
 import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log.js';
 import { runPipeline } from './src/core/pipeline.js';
 import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord } from './src/schema/store.js';
+import { mergeLoreEntries } from './src/core/prompts.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
     noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
@@ -119,6 +120,11 @@ const DEFAULTS = {
     // Phase 6 (§6): the compressor. Auto-compress is DEFAULT-OFF — GOAL.md §13
     // gates enabling it by default on the G2 human review of the torture test.
     compress: { auto: false, maxVisible: 40, mergeCount: 10 },
+    // §6: "A text box lists keys that are permanently triggered." Comma or
+    // newline separated lorebook trigger keywords; matching entries are always
+    // included in the composer's lorebook block (deduped against the triggered
+    // set by world+uid — an entry never appears twice).
+    permanentLoreKeys: '',
 };
 
 function settings() {
@@ -178,7 +184,7 @@ function saveSettings(patch) {
  * turn, because `chat_metadata` is reassigned by SillyTavern on load and a held
  * reference would silently diverge (trap 1).
  */
-function collectInput(turnId) {
+async function collectInput(turnId) {
     const list = chat();
     const messages = [];
     const window = settings().composer.maxChars;
@@ -209,7 +215,7 @@ function collectInput(turnId) {
     return {
         messages,
         extractions,
-        lorebook: readLorebook(),
+        lorebook: readLorebook(await readPermanentLorebook()),
         characterCard: ctx().name2 ?? '',
         narratorPrompt: ctx().systemPrompt ?? '',
         userRequest: activeRequestText(meta),
@@ -231,10 +237,48 @@ function collectInput(turnId) {
  */
 let lorebookEntries = new Map();
 
-function readLorebook() {
-    return [...lorebookEntries.values()]
+function readLorebook(extra = []) {
+    // §6: an entry never appears twice — triggered and permanent entries are
+    // merged by world+uid (mergeLoreEntries).
+    const merged = mergeLoreEntries([...lorebookEntries.values()], extra);
+    return merged
         .map((e) => `- ${e.comment ?? `entry ${e.uid}`}: ${e.content ?? ''}`)
         .join('\n');
+}
+
+/**
+ * §6: "A text box lists keys that are permanently triggered." Entries whose
+ * trigger keys match are looked up straight from the active world books, so
+ * they reach the composer EVERY turn — not only when ST's scan happens to
+ * trigger them. Cheap per generation (the books are already in memory).
+ */
+async function readPermanentLorebook() {
+    try {
+        const wanted = String(settings().permanentLoreKeys ?? '')
+            .split(/[,\n]/).map((k) => k.trim().toLowerCase()).filter(Boolean);
+        if (wanted.length === 0) {
+            return [];
+        }
+        const wi = await import('/scripts/world-info.js');
+        const out = [];
+        for (const world of (wi.selected_world_info ?? [])) {
+            const book = await wi.loadWorldInfo(world);
+            for (const e of Object.values(book?.entries ?? {})) {
+                if (!e || e.disable || typeof e.content !== 'string') {
+                    continue;
+                }
+                const keys = [...(e.key ?? []), ...(e.keysecondary ?? [])].map((k) => String(k).toLowerCase());
+                if (keys.some((k) => wanted.includes(k))) {
+                    out.push({ world, uid: e.uid, comment: e.comment ?? '', content: e.content });
+                }
+            }
+        }
+        return out;
+    } catch (err) {
+        // Trap 14: every decline logs one line.
+        log.warn('lorebook', `permanent-keys lookup failed: ${redact(String(err?.message ?? err))}`);
+        return [];
+    }
 }
 
 function noteTextOf(record) {
@@ -913,7 +957,7 @@ async function injectIntoUnsafe(payload, shape) {
     } else {
         const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
         const oldNote = lastNote ?? '';
-        let input = collectInput(token);
+        let input = await collectInput(token);
         const oldExtraction = (input.extractions ?? []).at(-1)?.text ?? '';
         let rerolls = 0;
         for (;;) {
@@ -1003,7 +1047,7 @@ async function injectIntoUnsafe(payload, shape) {
                 log.warn('reroll', 'diff popup reroll limit reached — keeping the newest composition');
                 break;
             }
-            input = collectInput(token);
+            input = await collectInput(token);
         }
     }
 
@@ -1231,6 +1275,7 @@ function installPanel() {
                 <div class="copilot-goals"></div>
                 <div class="copilot-presets"></div>
                 <div class="copilot-spend"></div>
+                <div class="copilot-lore"></div>
                 <div class="copilot-compress"></div>
                 <div class="copilot-transfer"></div>
                 <div class="copilot-records"></div>
@@ -1413,6 +1458,38 @@ function installPanel() {
         log.info('spend', 'pricing table saved');
         renderSpend();
         render();
+    });
+
+    // ---- The lorebook box (§6): keys that are permanently triggered.
+    const loreEl = panel.querySelector('.copilot-lore');
+    const renderLore = () => {
+        try {
+            // Keep unsaved typing across re-renders (the log subscriber fires
+            // mid-edit) — same guard as the transfer box.
+            const keep = loreEl.querySelector('[data-gr="lore-keys"]')?.value;
+            loreEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>lorebook</strong>
+                    <em class="copilot-spend-note">permanently triggered keys (comma or newline separated) — always in the composer's lorebook block</em>
+                </div>
+                <textarea data-gr="lore-keys" rows="2" placeholder="e.g. turbine, ancient_map"></textarea>
+                <div class="copilot-gr-add"><button type="button" data-act="lore-save">Save</button></div>`;
+            const ta = loreEl.querySelector('[data-gr="lore-keys"]');
+            if (ta) {
+                ta.value = keep ?? String(settings().permanentLoreKeys ?? '');
+            }
+        } catch (err) {
+            loreEl.textContent = `lorebook box unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    loreEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act="lore-save"]');
+        if (!btn) {
+            return;
+        }
+        const value = String(loreEl.querySelector('[data-gr="lore-keys"]')?.value ?? '');
+        saveSettings({ permanentLoreKeys: value });
+        const count = value.split(/[,\n]/).map((k) => k.trim()).filter(Boolean).length;
+        log.info('lorebook', `permanently triggered keys saved (${count} keys)`);
     });
 
     // ---- The compressor (phase 6, §6): one card per visible extraction with
@@ -1622,11 +1699,13 @@ function installPanel() {
         // Refresh the browser/goals/spend unless the user is typing in them.
         if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
             && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)
-            && !compressEl.contains(document.activeElement) && !transferEl.contains(document.activeElement)) {
+            && !compressEl.contains(document.activeElement) && !transferEl.contains(document.activeElement)
+            && !loreEl.contains(document.activeElement)) {
             renderRecords();
             renderGoals();
             renderPresets();
             renderSpend();
+            renderLore();
             renderCompress();
             renderTransfer();
         }
@@ -1636,6 +1715,7 @@ function installPanel() {
     renderGoals();
     renderPresets();
     renderSpend();
+    renderLore();
     renderCompress();
     renderTransfer();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);

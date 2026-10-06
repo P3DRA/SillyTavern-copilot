@@ -162,8 +162,9 @@
     border-radius: 3px;
 }
 
-/* ---- Import / export (phase 7) ---- */
-.copilot-transfer textarea {
+/* ---- Import / export (phase 7) + the lorebook keys box (§6) ---- */
+.copilot-transfer textarea,
+.copilot-lore textarea {
     width: 100%;
     box-sizing: border-box;
     font: inherit;
@@ -174,7 +175,8 @@
     border-radius: 3px;
 }
 
-.copilot-transfer button {
+.copilot-transfer button,
+.copilot-lore button {
     font-size: 11px;
     padding: 1px 8px;
     cursor: pointer;

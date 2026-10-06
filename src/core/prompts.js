@@ -345,6 +345,33 @@ export function renderEntries(entries) {
 }
 
 /**
+ * §6: "A lorebook entry never appears twice in the same composer prompt
+ * (dedupe by entry UID, including entries both triggered and permanent)."
+ * The dedupe key is world+uid — two books routinely share uid 0 (verified
+ * phase 0 against world-info.js:594). Triggered entries win the slot;
+ * permanent-only entries follow in their given order.
+ *
+ * @param {Array<{world?: string, uid?: number}>} activated
+ * @param {Array<{world?: string, uid?: number}>} permanent
+ */
+export function mergeLoreEntries(activated, permanent) {
+    const seen = new Set();
+    const out = [];
+    for (const e of [...(activated ?? []), ...(permanent ?? [])]) {
+        if (!e || e.uid === undefined) {
+            continue;
+        }
+        const key = `${e.world ?? '?'}.${e.uid}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        out.push(e);
+    }
+    return out;
+}
+
+/**
  * Goal facts for the composer prompt (§6 / S6): the SCRIPT-TRACKED counters as
  * plain prose — "introduce Bob (6 turns elapsed, 2 remaining)". The model is
  * TOLD the numbers; it is never asked to do arithmetic (GOAL.md §5).
