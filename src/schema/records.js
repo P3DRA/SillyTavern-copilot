@@ -443,36 +443,19 @@ export function tickRequests(requests) {
 
 /**
  * I3: snapshot before any bulk operation; keep the last five.
- * @typedef {object} Snapshot
- * @property {string} id
- * @property {number} createdAt
- * @property {string} reason
- * @property {object} payload
- * @property {number} bytes
+ * @typedef {object} Snapshot  the raw snapshotChat() output
+ * @property {number} version
+ * @property {Array<{messageIndex: number, swipeIds: number[], state: Array<object|null>}>} messages
  */
 
 export const MAX_SNAPSHOTS = 5;
 
 /**
- * @param {{reason: string, payload: unknown}} init
- * @returns {Snapshot}
+ * Snapshots are stored as the RAW `snapshotChat()` output
+ * ({ version, messages }) — an earlier draft wrapped them in
+ * { id, createdAt, reason, payload, bytes } and had a factory for it; nothing
+ * in the product ever used that shape (critique finding 27), so both are gone.
  */
-export function makeSnapshot(init) {
-    const payload = init?.payload;
-    let bytes = 0;
-    try {
-        bytes = JSON.stringify(payload ?? null).length;
-    } catch {
-        bytes = 0;
-    }
-    return {
-        id: newId('snap'),
-        createdAt: Date.now(),
-        reason: String(init?.reason || 'manual'),
-        payload: payload ?? null,
-        bytes,
-    };
-}
 
 /**
  * I3: keep the last 5, drop the oldest.
