@@ -235,6 +235,26 @@ export function ensureSwipeRecord(message, swipeIndex) {
  */
 export function writeSwipeRecord(message, swipeIndex, patch) {
     const target = ensureSwipeRecord(message, swipeIndex);
+    // I1 (critique round 1, finding 5): replacing the DATA fields preserves the
+    // old values in `history` — an append/continue turn reuses the same slot
+    // and ST re-emits MESSAGE_RECEIVED, which used to DESTROY the previous
+    // extraction/note/injection outright. Empty-patch writes (mirror refreshes)
+    // and non-data fields never touch history, so undo stays byte-identical.
+    const DATA_FIELDS = ['extraction', 'composer', 'injection'];
+    const replacesData = Boolean(patch) && DATA_FIELDS.some((k) => patch[k] !== undefined);
+    if (replacesData) {
+        const snapshot = { at: Date.now() };
+        let hadData = false;
+        for (const k of DATA_FIELDS) {
+            if (target[k] !== undefined && target[k] !== null) {
+                snapshot[k] = JSON.parse(JSON.stringify(target[k]));
+                hadData = true;
+            }
+        }
+        if (hadData) {
+            target.history = [...(Array.isArray(target.history) ? target.history : []), snapshot];
+        }
+    }
     Object.assign(target, patch, { version: SCHEMA_VERSION });
     mirrorToMessageExtra(message, swipeIndex, peekSwipeRoot(message, swipeIndex));
     return target;

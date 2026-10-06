@@ -187,6 +187,11 @@ export function takePendingSkip(token = currentToken) {
     return taken;
 }
 
+/** Non-destructive: is a skip waiting for this generation's reply? */
+export function hasPendingSkip(token = currentToken) {
+    return Boolean(pendingSkip && pendingSkip.token === token);
+}
+
 /* ---------------------------------------------------------------- injection */
 
 /**

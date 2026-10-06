@@ -48,6 +48,7 @@ import {
     ctx, chat, eventSource, saveChatConditional, saveMetadata,
     nextToken, isCurrent, resetTokens, clearPending,
     setPending, getPending, bindToMessage, recordSkip, registerNote, clearNote,
+    hasPendingSkip,
 } from './src/st/adapter.js';
 
 const log = new DebugLog();
@@ -732,6 +733,26 @@ let rerollChoice = null;
  * Cancel/Escape resolves as 'reuse' — the benign answer: no model call, and the
  * choice is recorded on the record either way.
  */
+/**
+ * Trap 7: a popup left open must never hang a generation. Every popup is raced
+ * against a timeout that resolves to its documented benign answer (critique
+ * round 1 found both popups awaited forever — a chat change does not resolve
+ * a Popup promise).
+ */
+function popupWithTimeout(promise, ms, fallback, label) {
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => {
+            log.warn('popup', `${label} unanswered for ${ms}ms — using the benign default '${fallback}' (trap 7)`);
+            resolve(fallback);
+        }, ms);
+    });
+    return Promise.race([
+        Promise.resolve(promise).finally(() => clearTimeout(timer)),
+        timeout,
+    ]);
+}
+
 async function askRerollChoice() {
     try {
         const PopupCls = ctx().Popup;
@@ -739,12 +760,15 @@ async function askRerollChoice() {
             log.warn('reroll', 'no Popup in the ST context — defaulting to a new note');
             return 'new';
         }
-        const result = await PopupCls.show.confirm(
-            'Copilot note for this swipe',
-            'Compose a NEW composer note for this generation, or REUSE the current one?',
-            { okButton: 'Compose a new note', cancelButton: 'Reuse the current note' },
+        // Benign default on timeout = 'reuse' (no model call — decision record 4).
+        return await popupWithTimeout(
+            PopupCls.show.confirm(
+                'Copilot note for this swipe',
+                'Compose a NEW composer note for this generation, or REUSE the current one?',
+                { okButton: 'Compose a new note', cancelButton: 'Reuse the current note' },
+            ).then((result) => (result === 1 ? 'new' : 'reuse')),
+            45000, 'reuse', 'reroll popup',
         );
-        return result === 1 ? 'new' : 'reuse';
     } catch (err) {
         log.warn('reroll', `popup failed — defaulting to a new note: ${redact(String(err?.message ?? err))}`);
         return 'new';
@@ -772,24 +796,30 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
             ${block('OLD note', oldNote)}
             ${block('NEW note', newNote)}
         </div>`;
-        const result = await call(html, POPUP_TYPE.CONFIRM, null, {
-            okButton: 'Use the NEW note',
-            cancelButton: 'Use the OLD note',
-            customButtons: [
-                { text: 'Reroll (compose again)', result: 1001 },
-                { text: 'Cancel (no note)', result: 1002 },
-            ],
-        });
-        if (result === 1) {
-            return 'new';
-        }
-        if (result === 1001) {
-            return 'reroll';
-        }
-        if (result === 1002) {
-            return 'cancel';
-        }
-        return 'old';
+        // Benign default on timeout = 'new' (use what was composed; matches the
+        // catch default). Never hangs the generation (trap 7).
+        return await popupWithTimeout(
+            call(html, POPUP_TYPE.CONFIRM, null, {
+                okButton: 'Use the NEW note',
+                cancelButton: 'Use the OLD note',
+                customButtons: [
+                    { text: 'Reroll (compose again)', result: 1001 },
+                    { text: 'Cancel (no note)', result: 1002 },
+                ],
+            }).then((result) => {
+                if (result === 1) {
+                    return 'new';
+                }
+                if (result === 1001) {
+                    return 'reroll';
+                }
+                if (result === 1002) {
+                    return 'cancel';
+                }
+                return 'old';
+            }),
+            60000, 'new', 'diff popup',
+        );
     } catch (err) {
         log.warn('reroll', `diff popup failed — defaulting to the new note: ${redact(String(err?.message ?? err))}`);
         return 'new';
@@ -1154,8 +1184,10 @@ function onMessageReceived() {
     // Every arrival logs exactly one line (trap 14). Without this, "the record
     // is missing" is indiagnosable: the event may not have fired, or the bind
     // may have thrown before it logged anything.
-    log.info('store', `message received — token=${token} pending=${has ? has.token : 'none'}`);
-    if (!has) {
+    log.info('store', `message received — token=${token} pending=${has ? has.token : (hasPendingSkip(token) ? 'skip' : 'none')}`);
+    // Bind whenever a NOTE or a SKIP is pending for this token (F1: a failed
+    // turn carries a skip record that must land on the reply).
+    if (!has && !hasPendingSkip(token)) {
         return;
     }
     let result;
@@ -1168,13 +1200,43 @@ function onMessageReceived() {
     }
     const turn = log.turn(String(token));
     if (result.bound) {
-        turn.injection = `${turn.injection ?? 'note'} -> bound to message ${result.messageIndex} swipe ${result.swipeIndex}`;
-        log.info('store', `note bound to message ${result.messageIndex} swipe ${result.swipeIndex}`);
+        const what = result.skipped ? 'skip record' : 'note';
+        turn.injection = `${turn.injection ?? what} -> bound to message ${result.messageIndex} swipe ${result.swipeIndex}`;
+        log.info('store', `${what} bound to message ${result.messageIndex} swipe ${result.swipeIndex}`);
         saveChatConditional?.();
     } else {
         log.warn('store', `note could not be bound: ${result.reason}`);
     }
     injectedTokens.delete(token);
+    // Reviewer-3: auto-compress is AUTOMATIC when the setting is on (G2 gates
+    // the DEFAULT, not the wiring). Fire-and-forget — a slow merge must never
+    // block the turn (I5).
+    maybeAutoCompress();
+}
+
+/**
+ * §6 "Auto: when more than X extractions exist, merge the Y oldest" — the real
+ * behavior behind the panel's checkbox (critique round 1 found the checkbox
+ * decorative: nothing read the setting).
+ */
+function maybeAutoCompress() {
+    try {
+        const s = settings();
+        if (!s.compress?.auto) {
+            return;
+        }
+        const visible = collectExtractions(chat()).length;
+        const threshold = s.compress?.maxVisible ?? 40;
+        if (visible <= threshold) {
+            return;
+        }
+        log.info('compress', `auto: ${visible} visible > ${threshold} — merging the oldest usable run`);
+        runAutoCompression().catch((err) => {
+            log.warn('compress', `auto-compress failed: ${redact(String(err?.message ?? err))}`);
+        });
+    } catch (err) {
+        log.warn('compress', `auto-compress check failed: ${redact(String(err?.message ?? err))}`);
+    }
 }
 
 function onChatChanged() {

@@ -159,6 +159,18 @@ export async function attempt(args) {
 
     onEvent({ kind: 'request', model, maxTokens, messages, bodyPreview: redact(JSON.stringify(body)) });
 
+    // Trap 7 / F4 (critique round 1): a hung fetch must never hang the
+    // generation — every call gets a hard per-call timeout, composed with any
+    // caller-provided signal. Before this, NO call was bounded at all.
+    const timeoutMs = args.timeoutMs ?? 120000;
+    const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+        ? AbortSignal.timeout(timeoutMs)
+        : undefined;
+    let effectiveSignal = signal ?? timeoutSignal;
+    if (signal && timeoutSignal && typeof AbortSignal.any === 'function') {
+        effectiveSignal = AbortSignal.any([signal, timeoutSignal]);
+    }
+
     let res;
     try {
         res = await fetchImpl(`${baseUrl}/chat/completions`, {
@@ -170,10 +182,13 @@ export async function attempt(args) {
                 'X-Title': 'SillyTavern Copilot',
             },
             body: JSON.stringify(body),
-            signal,
+            signal: effectiveSignal,
         });
     } catch (err) {
-        if (signal?.aborted) {
+        if (timeoutSignal?.aborted) {
+            return finish({ reason: FAIL.NETWORK, detail: `timed out after ${timeoutMs}ms (trap 7)` });
+        }
+        if (effectiveSignal?.aborted) {
             return finish({ reason: FAIL.ABORTED, detail: 'the request was aborted' });
         }
         return finish({ reason: FAIL.NETWORK, detail: redact(String(err?.message ?? err)) });
@@ -226,9 +241,20 @@ export async function attempt(args) {
     // THINKING_ONLY (trap 17): empty content, reasoning tokens spent. Found live:
     // a reasoning model spends the whole allowance thinking and answers nothing.
     if (verdict.reason === REJECT.THINKING_ONLY && maxTokens < 32768) {
-        onEvent({ kind: 'reasoning-budget-retry', model, from: maxTokens, to: maxTokens * 4 });
+        onEvent({
+            kind: 'reasoning-budget-retry', model, from: maxTokens, to: maxTokens * 4,
+            droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
+        });
         const retry = await attempt({ ...args, maxTokens: maxTokens * 4 });
-        return { ...retry, budgetRetried: true };
+        // F5 (critique round 1): the DROPPED attempt consumed real tokens
+        // (thinking) — fold its usage into the returned record so spend
+        // accounting and the failure log see every cent (it used to vanish).
+        return {
+            ...retry,
+            budgetRetried: true,
+            tokensIn: (retry.tokensIn ?? 0) + (record.tokensIn ?? 0),
+            tokensOut: (retry.tokensOut ?? 0) + (record.tokensOut ?? 0),
+        };
     }
 
     // UNCLOSED_TAG (trap 4): the model opened `<copilot>` and was cut off
@@ -237,9 +263,17 @@ export async function attempt(args) {
     // declaring the model incapable, and the bigger cost is only paid when the
     // small budget has already failed.
     if (verdict.reason === REJECT.UNCLOSED_TAG && maxTokens < 32768) {
-        onEvent({ kind: 'truncation-budget-retry', model, from: maxTokens, to: maxTokens * 2 });
+        onEvent({
+            kind: 'truncation-budget-retry', model, from: maxTokens, to: maxTokens * 2,
+            droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
+        });
         const retry = await attempt({ ...args, maxTokens: maxTokens * 2 });
-        return { ...retry, budgetRetried: true };
+        return {
+            ...retry,
+            budgetRetried: true,
+            tokensIn: (retry.tokensIn ?? 0) + (record.tokensIn ?? 0),
+            tokensOut: (retry.tokensOut ?? 0) + (record.tokensOut ?? 0),
+        };
     }
 
     return finish({
