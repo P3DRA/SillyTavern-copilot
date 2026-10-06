@@ -1263,9 +1263,9 @@ function installPanel() {
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>Copilot</b>
                 <code class="copilot-build">build ${BUILD_ID}</code>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div>
             </div>
-            <div class="inline-drawer-content" style="display: none;">
+            <div class="inline-drawer-content">
                 <div class="copilot-head">
                     <button type="button" data-act="copy">Copy log</button>
                     <button type="button" data-act="clear">Clear</button>
@@ -1286,17 +1286,12 @@ function installPanel() {
         || document.body;
     host.appendChild(panel);
 
-    // The accordion collapse, through ST's own helper (utils.js toggleDrawer).
-    const drawer = panel.querySelector('.inline-drawer');
-    panel.querySelector('.inline-drawer-toggle').addEventListener('click', async () => {
-        try {
-            const utils = await import('/scripts/utils.js');
-            const expanded = drawer.querySelector('.inline-drawer-content').style.display !== 'none';
-            utils.toggleDrawer(drawer, !expanded);
-        } catch (err) {
-            log.warn('panel', `drawer toggle failed: ${redact(String((err && err.message) || err))}`);
-        }
-    });
+    // NO toggle listener here on purpose: ST has a GLOBAL delegated handler
+    // for every `.inline-drawer-toggle` click (script.js:12131) that slides the
+    // content and flips the chevron. Binding our own toggle on top of it
+    // double-toggled the drawer on each click — it opened and instantly closed
+    // (user report with screenshot). The markup above ships OPEN so the log is
+    // visible on install; ST's own handler owns the accordion from there.
 
     const body = panel.querySelector('.copilot-body');
     const render = () => {
