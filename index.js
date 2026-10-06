@@ -27,7 +27,7 @@
 import { EVENT, GENERATION_TYPE, NOTE_TAG } from './src/st/constants.js';
 import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log.js';
 import { runPipeline } from './src/core/pipeline.js';
-import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord, restoreChat } from './src/schema/store.js';
+import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord, restoreChat, foldSupersededHistory } from './src/schema/store.js';
 import { mergeLoreEntries } from './src/core/prompts.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
@@ -634,7 +634,11 @@ async function runAutoCompression() {
         log.info('compress', `auto: nothing to merge (${entries.length} visible, threshold ${s.compress?.maxVisible ?? 40})`);
         return { ok: true, reason: null, merged: 0 };
     }
-    const res = await runManualCompression(indices);
+    // R3-F3: autoSelect returns INDICES; runManualCompression resolves IDS.
+    // Feeding indices to the id resolver made auto-compress dead — it refused
+    // every run ("select at least two entries") while the log claimed merges.
+    const ids = indices.map((i) => entries[i]?.extraction?.id).filter(Boolean);
+    const res = await runManualCompression(ids);
     log.info('compress', `auto: ${res.ok ? `merged ${res.merged}` : `skipped — ${res.reason}`}`);
     return res;
 }
@@ -750,6 +754,12 @@ function restorePreImport() {
  * silently.
  */
 function injectIntoArray(prompt, note, opts) {
+    // M2 (round 3): 'none' means log-only on EVERY shape — the array path
+    // ignored it and shipped the note on chat-completion sources while the
+    // record claimed log-only.
+    if (opts.position === 'none') {
+        return 0;
+    }
     const block = { role: opts.role === 'user' ? 'user' : (opts.role === 'assistant' ? 'assistant' : 'system'), content: `<${NOTE_TAG}>\n${note}\n</${NOTE_TAG}>` };
     if (opts.position === 'first') {
         prompt.unshift(block);
@@ -948,6 +958,24 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
     // the object. GENERATION_STARTED fires BEFORE the deletion, so stash the
     // record here and fold it into the new message's history when it lands.
     supersededRecord = null;
+    // R3-F5: if the message carrying the last bound record has been DELETED
+    // (group regenerate, tool calls — both delete BEFORE this event and never
+    // fire type 'regenerate'), recover the record from the mirror so it folds
+    // into the next reply's history instead of dying (I1).
+    try {
+        const metaRoot = ctx().chatMetadata;
+        const mirror = metaRoot?.copilot?.lastBoundRecord;
+        if (mirror && mirror.record && mirror.messageIndex >= (chat()?.length ?? 0)) {
+            supersededRecord = { at: Date.now(), epoch: chatSeq, token: currentTokenValue(), ...mirror.record };
+            const root = metaRoot.copilot ?? (metaRoot.copilot = {});
+            root.pendingSupersede = supersededRecord;
+            delete root.lastBoundRecord;
+            saveMetadata();
+            log.info('store', 'a deleted message carried the last bound record — recovered into the supersede stash (I1)');
+        }
+    } catch (err) {
+        log.warn('store', `mirror recovery failed: ${redact(String(err?.message ?? err))}`);
+    }
     if (type === 'regenerate') {
         try {
             const list = chat();
@@ -956,9 +984,14 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
             if (rec && (rec.extraction || rec.composer)) {
                 supersededRecord = {
                     at: Date.now(),
+                    epoch: chatSeq,
+                    token: currentTokenValue(),
                     extraction: rec.extraction ? JSON.parse(JSON.stringify(rec.extraction)) : undefined,
                     composer: rec.composer ? JSON.parse(JSON.stringify(rec.composer)) : undefined,
                     injection: rec.injection ? JSON.parse(JSON.stringify(rec.injection)) : undefined,
+                    // R3-F4: WITHOUT the history, a second regenerate folded a
+                    // history-less stash over the first — losing the original.
+                    history: Array.isArray(rec.history) ? JSON.parse(JSON.stringify(rec.history)) : [],
                 };
                 // Persisted so a reload mid-regenerate still folds it back (and
                 // so 'reuse' can find the right note afterwards).
@@ -1297,6 +1330,9 @@ async function injectIntoUnsafe(payload, shape) {
     // not a stale module variable — 'use old' and reuse-after-reload used to
     // verify the wrong text and report "NOT FOUND" for a note that shipped.
     deliveredNote = note;
+    // R3-F11 (trap 12): lastNote must track what was DELIVERED — after diff
+    // popup 'use old' it kept the REJECTED note and the next "reuse" served it.
+    lastNote = note;
 
     // Keep the note for the registry route and for binding after the reply lands.
     setPending(note, {
@@ -1391,6 +1427,10 @@ function onMessageReceived() {
     // Bind whenever a NOTE or a SKIP is pending for this token (F1: a failed
     // turn carries a skip record that must land on the reply).
     if (!has && !hasPendingSkip(token)) {
+        // R3-F6: the turn is over even when nothing was pending (disabled /
+        // no-key turns) — the latch must not stick at 'real' or a later raw
+        // call passes the rule-5 gate.
+        generationKind = 'none';
         return;
     }
     let result;
@@ -1399,6 +1439,7 @@ function onMessageReceived() {
     } catch (err) {
         log.error('store', `bind threw: ${redact(String(err?.message ?? err))}`);
         injectedTokens.delete(token);
+        generationKind = 'none'; // R3-F6
         return;
     }
     const turn = log.turn(turnKey(token));
@@ -1408,12 +1449,20 @@ function onMessageReceived() {
         log.info('store', `${what} bound to message ${result.messageIndex} swipe ${result.swipeIndex}`);
         // T-R2-2 (I1): fold the record ST deleted on regenerate into the new
         // message's history — rerolls must never destroy original data.
+        // R3-F10: a stash belongs to ONE turn and ONE chat — a regenerate whose
+        // reply never landed must not fold into some later reply, and chat A's
+        // stash must never fold into chat B (traps 6/7).
         const stashNow = supersededRecord ?? ctx().chatMetadata?.copilot?.pendingSupersede ?? null;
-        if (stashNow) {
+        const stashFresh = Boolean(stashNow)
+            && stashNow.epoch === chatSeq
+            && (!stashNow.token || stashNow.token === token);
+        if (stashFresh) {
             try {
                 const target = readSwipeRecordOrNull(chat()[result.messageIndex], result.swipeIndex);
                 if (target) {
-                    target.history = [...(Array.isArray(target.history) ? target.history : []), stashNow];
+                    // R3-F4: the pure fold flattens the stash's own history (a
+                    // second regenerate) so no original is ever replaced.
+                    foldSupersededHistory(target, stashNow);
                     writeSwipeRecord(chat()[result.messageIndex], result.swipeIndex, {});
                     log.info('store', 'regenerate: the superseded record folded into history (I1 — nothing destroyed)');
                 }
@@ -1426,10 +1475,34 @@ function onMessageReceived() {
                 delete metaRoot.copilot.pendingSupersede;
                 saveMetadata();
             }
+        } else if (stashNow) {
+            // R3-F10: a stale stash (wrong token or chat) is DISCARDED with a
+            // line — folding it would put one turn's record into another's.
+            log.warn('store', 'a stale supersede stash was discarded (wrong turn or chat) — nothing folded');
+            supersededRecord = null;
         }
         saveChatConditional?.();
     } else {
         log.warn('store', `note could not be bound: ${result.reason}`);
+    }
+    // R3-F5: keep a recovery mirror of the record this turn bound. Group flows
+    // and tool-call deletes REMOVE the message before the next
+    // GENERATION_STARTED (which then fires with type 'normal'), so the
+    // regenerate-only stash never sees them — the mirror does.
+    try {
+        const metaRoot = ctx().chatMetadata;
+        if (metaRoot && result.bound) {
+            const root = metaRoot.copilot ?? (metaRoot.copilot = {});
+            const recNow = readSwipeRecordOrNull(chat()[result.messageIndex], result.swipeIndex);
+            root.lastBoundRecord = {
+                messageIndex: result.messageIndex,
+                swipeIndex: result.swipeIndex,
+                record: recNow ? JSON.parse(JSON.stringify(recNow)) : null,
+            };
+            saveMetadata();
+        }
+    } catch (err) {
+        log.warn('store', `could not keep the last-bound mirror: ${redact(String(err?.message ?? err))}`);
     }
     injectedTokens.delete(token);
     generationKind = 'none'; // R2-1: the turn is over — raw/quiet calls after it decline
@@ -1473,6 +1546,7 @@ function onChatChanged() {
     chatSeq += 1; // F12: turn ids never collide across chats
     generationKind = 'none'; // R2-1
     rerollChoice = null; // R2-18: a cross-chat 'reuse' must never fire silently
+    supersededRecord = null; // R3-F10: one chat's stash must never fold into another's
     const droppedOnSwitch = clearPending(SKIP.CHAT_CHANGED);
     resetTokens();
     injectedTokens.clear();
@@ -1537,8 +1611,13 @@ function installWatcher() {
             // F16 (critique round 1): only OUR turns are watched. Quiet
             // generations and other extensions call the same endpoint — they
             // must not be logged as "note NOT FOUND" nor counted as narrator
-            // spend. `turnInFlight` spans exactly GENERATION_STARTED → reply.
-            if (isBackend && typeof init?.body === 'string' && turnInFlight) {
+            // spend. generationKind is latched 'real' at GENERATION_STARTED and
+            // cleared at reply/chat-change — exactly the in-flight window.
+            // (B1, round 3: this condition used `turnInFlight`, which was
+            // declared NOWHERE — the watcher threw on every request and the
+            // script-verified chain + narrator spend were dead on the shipped
+            // build, while every available gate stayed green.)
+            if (isBackend && typeof init?.body === 'string' && generationKind === 'real') {
                 watched = true;
                 watchChatSeq = chatSeq;
                 const turn = log.turn(turnKey(currentTokenSafe()));
@@ -2315,6 +2394,24 @@ function init() {
     es.on(EVENT.MESSAGE_RECEIVED, () => onMessageReceived());
     es.on(EVENT.CHAT_CHANGED, () => onChatChanged());
     es.on(EVENT.WORLD_INFO_ACTIVATED, (entries) => onWorldInfoActivated(entries));
+    // R3-F6/F15 (and m4): a turn can end WITHOUT MESSAGE_RECEIVED (aborts;
+    // onErrorStreaming deliberately skips it for some types). The latch must
+    // not stick at 'real' — a raw call in that window passed the rule-5 gate —
+    // and the registered note must not leak into quiet generations between
+    // turns. Note: NO clearPending here — the reply may not have bound yet.
+    const finishTurn = (what) => {
+        generationKind = 'none';
+        clearNote();
+        log.info('generation', `${what} — turn latch reset, registered note cleared`);
+    };
+    es.on(EVENT.GENERATION_STOPPED, () => finishTurn('generation stopped'));
+    es.on(EVENT.GENERATION_ENDED, () => finishTurn('generation ended'));
+    // R3-F5: when a message carrying a record is DELETED outside a regenerate
+    // (group flows, tool calls), the reply-slot record dies with it. The
+    // recovery mirror (lastBoundRecord) is re-checked at every GENERATION_STARTED.
+    es.on(EVENT.MESSAGE_DELETED, () => {
+        log.info('store', 'message deleted — the last-bound mirror will recover its record if the next turn needs it');
+    });
 
     installWatcher();
     installPanel();

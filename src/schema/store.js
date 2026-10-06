@@ -280,6 +280,28 @@ export function writeSwipeRecord(message, swipeIndex, patch) {
 }
 
 /**
+ * I1 (T-R2-2 / R3-F4): fold a SUPERSEDED record — from a regenerate or a
+ * deleted message — into a record's history. The stash may carry its own
+ * history (a second regenerate): flatten it, or the first original is lost.
+ * Pure and testable; index.js calls it at bind time.
+ *
+ * @param {object} record the live record
+ * @param {{history?: object[]}} stash
+ */
+export function foldSupersededHistory(record, stash) {
+    if (!record || !stash) {
+        return record;
+    }
+    const { history: stashHistory, ...stashEntry } = stash;
+    record.history = [
+        ...(Array.isArray(record.history) ? record.history : []),
+        ...(Array.isArray(stashHistory) ? stashHistory : []),
+        stashEntry,
+    ];
+    return record;
+}
+
+/**
  * The authoritative copilot root for a swipe, for the mirror to read.
  * @param {object} message
  * @param {number} swipeIndex

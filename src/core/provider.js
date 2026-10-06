@@ -64,20 +64,24 @@ export function isReasoningModel(model) {
 }
 
 export function maxTokensFor(model, override) {
-    // Trap 17 / Reviewer-16: max_tokens is PER MODEL in a fallback chain — one
-    // blanket number must not clobber the per-model budgets (a reasoning model
-    // silently produced nothing under a small blanket value; that is what
-    // MODEL_BUDGETS exists for). A per-model MAP overrides any single model;
-    // a plain number applies only to models MODEL_BUDGETS does not know.
+    // The ORDER here carries two lessons:
+    //  - Trap 17: a chain needs PER-MODEL budgets — MODEL_BUDGETS supplies
+    //    defaults so one blanket number cannot silently break a reasoning model.
+    //  - R3-F2 (blocker): when the TABLE beat a numeric override, the budget
+    //    retries (×4 reasoning, ×2 truncation) re-sent the SAME budget forever
+    //    (qwen3.7-flash: [4096,4096,4096,…]) — an unbounded metered loop inside
+    //    ST's awaited hook. An explicit per-call number is either the USER's
+    //    setting or a retry escalation: it must WIN. The table is the default
+    //    when nothing is specified. A per-model map wins per model.
     if (override && typeof override === 'object'
         && Number.isFinite(Number(override[model])) && Number(override[model]) > 0) {
         return Math.floor(Number(override[model]));
     }
-    if (Object.hasOwn(MODEL_BUDGETS, model)) {
-        return MODEL_BUDGETS[model];
-    }
     if (Number.isFinite(override) && override > 0) {
         return Math.floor(override);
+    }
+    if (Object.hasOwn(MODEL_BUDGETS, model)) {
+        return MODEL_BUDGETS[model];
     }
     return isReasoningModel(model) ? 4096 : MODEL_BUDGETS.default;
 }
@@ -256,12 +260,12 @@ export async function attempt(args) {
     //
     // THINKING_ONLY (trap 17): empty content, reasoning tokens spent. Found live:
     // a reasoning model spends the whole allowance thinking and answers nothing.
-    if (verdict.reason === REJECT.THINKING_ONLY && maxTokens < 32768) {
+    if (verdict.reason === REJECT.THINKING_ONLY && maxTokens < 32768 && (args.budgetDepth ?? 0) < 2) {
         onEvent({
             kind: 'reasoning-budget-retry', model, from: maxTokens, to: maxTokens * 4,
             droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
         });
-        const retry = await attempt({ ...args, maxTokens: maxTokens * 4 });
+        const retry = await attempt({ ...args, maxTokens: maxTokens * 4, budgetDepth: (args.budgetDepth ?? 0) + 1 });
         // F5 (critique round 1): the DROPPED attempt consumed real tokens
         // (thinking) — fold its usage into the returned record so spend
         // accounting and the failure log see every cent (it used to vanish).
@@ -278,12 +282,12 @@ export async function attempt(args) {
     // Retrying the same model with more room is far likelier to succeed than
     // declaring the model incapable, and the bigger cost is only paid when the
     // small budget has already failed.
-    if (verdict.reason === REJECT.UNCLOSED_TAG && maxTokens < 32768) {
+    if (verdict.reason === REJECT.UNCLOSED_TAG && maxTokens < 32768 && (args.budgetDepth ?? 0) < 2) {
         onEvent({
             kind: 'truncation-budget-retry', model, from: maxTokens, to: maxTokens * 2,
             droppedAttempt: { tokensIn: record.tokensIn ?? 0, tokensOut: record.tokensOut ?? 0, reason: verdict.reason },
         });
-        const retry = await attempt({ ...args, maxTokens: maxTokens * 2 });
+        const retry = await attempt({ ...args, maxTokens: maxTokens * 2, budgetDepth: (args.budgetDepth ?? 0) + 1 });
         return {
             ...retry,
             budgetRetried: true,

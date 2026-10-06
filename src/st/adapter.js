@@ -125,6 +125,10 @@ export function setPending(note, meta = {}) {
         // the phase-1 done-when requires exactly that.
         extraction: meta.extraction ?? null,
         composer: meta.composer ?? null,
+        // M1 (round 3): `injected` must survive here — setPending used to drop
+        // it, and `note.injected !== false` then computed TRUE for every turn,
+        // so log-only ('none') turns were stored as injected:true.
+        injected: meta.injected !== false,
         // R2-6 (I7): a bounded trace of the turn's inputs/outputs rides the
         // record so the audit trail survives RELOADS (the DebugLog is RAM-only
         // and evicts at MAX_TURNS). Truncation is marked, never silent.
@@ -267,6 +271,9 @@ export function bindToMessage(token) {
                 composer: note.composer,
                 goalIds: note.goalIds,
                 requestIds: note.requestIds,
+                // M5 (round 3): the trace used to be dropped on exactly this
+                // path — the one that exists to SAVE data.
+                trace: note.trace,
             });
         }
         if (skip || salvage) {
