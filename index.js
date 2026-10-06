@@ -28,7 +28,7 @@ import { EVENT, GENERATION_TYPE, NOTE_TAG } from './src/st/constants.js';
 import { DebugLog, SKIP, verifyInOutgoing, BUILD_ID } from './src/core/debug-log.js';
 import { runPipeline } from './src/core/pipeline.js';
 import { collectExtractions, listRecords, readSwipeRecordOrNull, writeSwipeRecord, restoreChat, foldSupersededHistory } from './src/schema/store.js';
-import { mergeLoreEntries } from './src/core/prompts.js';
+import { mergeLoreEntries, DEFAULT_EXTRACTOR_PROMPT, DEFAULT_COMPOSER_PROMPT, DEFAULT_COMPRESSOR_PROMPT } from './src/core/prompts.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
     noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
@@ -44,6 +44,7 @@ import {
 import { exportChatState, importChatState, restoreImport } from './src/schema/transfer.js';
 import { callWithFallback } from './src/core/provider.js';
 import { redact } from './src/core/redact.js';
+import { normalizeKey, isPlausibleKey, resolveKey, keySource, keyProblem } from './src/core/keysource.js';
 import {
     ctx, chat, eventSource, saveChatConditional, saveMetadata,
     nextToken, resetTokens, clearPending,
@@ -89,12 +90,14 @@ const DEFAULTS = {
         retries: 1,
         temperature: 0.2,
         maxChars: 6000,
+        maxMessages: 12,
     },
     composer: {
         chain: ['qwen/qwen3.7-flash', 'sao10k/l3-lunaris-8b', 'dots-studio/dots-3-note-preview:free'],
         retries: 1,
         temperature: 0.7,
         maxChars: 8000,
+        maxMessages: 20,
         minWords: 15,
         maxWords: 120,
     },
@@ -133,6 +136,9 @@ const DEFAULTS = {
     // included in the composer's lorebook block (deduped against the triggered
     // set by world+uid — an entry never appears twice).
     permanentLoreKeys: '',
+    // The compressor's own model chain (§6: the compressor is a role) — falls
+    // back to the extractor's chain when empty.
+    compressorChain: [],
 };
 
 function settings() {
@@ -151,28 +157,67 @@ function settings() {
  * R2-8 / GOAL §9.2 — the key resolution chain, honestly documented:
  *   1. `settings.apiKey` — set from this panel; stored PLAINTEXT inside
  *      extension_settings (the UI says so).
- *   2. ST's server-side OpenRouter secret — the REAL secret store:
- *      `/scripts/secrets.js` `secret_state[SECRET_KEYS.OPENROUTER]`. The old
- *      code called `ctx().getSecret`, which does not exist in the context at
- *      all — that branch was dead code and the placeholder lied about it.
- * The secret is cached here and refreshed at init and every turn start.
+ *   2. ST's server-side OpenRouter secret — read through secrets.js `findSecret`.
+ *
+ * T-R4-1 (BLOCKER, user report: "I always got an error 'HTTP 401'"): the old
+ * code did `String(secret_state[OPENROUTER][0])` and sent THAT as the key. But
+ * `secret_state[key]` is a list of secret DESCRIPTORS — `{id, value: MASKED,
+ * label, active}` (src/endpoints/secrets.js getSecretState) — so the literal
+ * string "[object Object]" went out as the bearer token and every turn 401'd,
+ * whatever key was configured. The descriptor list only proves a secret EXISTS;
+ * the VALUE comes from `findSecret`, and the server answers 403 for it unless
+ * `allowKeysExposure: true` is set in config.yaml. See src/core/keysource.js.
  */
 let stSecretKey = '';
+/** 'unknown' | 'ok' | 'missing' | 'unreadable' — why the fallback is or is not usable. */
+let stSecretStatus = 'unknown';
 
 async function refreshSecretKey() {
+    stSecretKey = '';
+    stSecretStatus = 'missing';
     try {
         const sec = await import('/scripts/secrets.js');
         const name = sec.SECRET_KEYS?.OPENROUTER ?? 'api_key_openrouter';
-        const v = sec.secret_state?.[name];
-        stSecretKey = Array.isArray(v) ? String(v[0] ?? '') : String(v ?? '');
+        const entries = sec.secret_state?.[name];
+        const listed = Array.isArray(entries) ? entries : (entries ? [entries] : []);
+        if (listed.length === 0) {
+            stSecretStatus = 'missing';
+            return stSecretKey;
+        }
+        // The descriptors carry a MASKED value — never usable as a key. Ask the
+        // server for the real one (active entry first).
+        const active = listed.find((e) => e && e.active) ?? listed[0];
+        const id = active && active.id ? active.id : undefined;
+        const value = typeof sec.findSecret === 'function' ? await sec.findSecret(name, id) : null;
+        const key = normalizeKey(value);
+        if (isPlausibleKey(key)) {
+            stSecretKey = key;
+            stSecretStatus = 'ok';
+        } else {
+            // Secret present but 403/masked/null — say so; never guess.
+            stSecretStatus = 'unreadable';
+        }
     } catch {
-        stSecretKey = '';
+        stSecretStatus = 'unreadable';
     }
     return stSecretKey;
 }
 
 function apiKey() {
-    return String(settings().apiKey || stSecretKey || '') || null;
+    // Hand-typed keys carry stray spaces/quotes (one trailing space = endless
+    // HTTP 401), and T-R4-1: nothing that cannot be a bearer token may ever
+    // reach the provider.
+    return resolveKey({ panelKey: settings().apiKey, secretKey: stSecretKey });
+}
+
+/** Which source supplied the key — for the pilot light and the status line. */
+function apiKeySource() {
+    return keySource({ panelKey: settings().apiKey, secretKey: stSecretKey });
+}
+
+/** One actionable sentence for the log and the pilot light; '' when all is well. */
+function apiKeyProblem() {
+    return keyProblem({ panelKey: settings().apiKey, secretKey: stSecretKey, secretStatus: stSecretStatus });
 }
 
 function saveSettings(patch) {
@@ -203,6 +248,9 @@ async function collectInput(turnId) {
     const list = chat();
     const messages = [];
     const window = settings().composer.maxChars;
+    // User-facing knob: HOW MANY recent messages (the old chars window was
+    // unintelligible). The char budget stays as a hidden safety cap.
+    const maxMessages = Number(settings().composer.maxMessages ?? 20) || 20;
     // Walk backwards so a budget drops whole OLDEST messages (trap 4).
     let used = 0;
     for (let i = list.length - 1; i >= 0; i -= 1) {
@@ -212,6 +260,9 @@ async function collectInput(turnId) {
             continue;
         }
         const cost = text.length;
+        if (messages.length >= maxMessages) {
+            break;
+        }
         if (used + cost > window && messages.length > 0) {
             break;
         }
@@ -507,7 +558,9 @@ function deletePreset(id) {
 function compressorCall(messages) {
     const s = settings();
     return callWithFallback({
-        models: s.extractor?.chain ?? [],
+        // The compressor has its own chain (the user asked for a model
+        // selector); it falls back to the extractor's chain.
+        models: s.compressorChain?.length ? s.compressorChain : (s.extractor?.chain ?? []),
         retries: s.extractor?.retries ?? 1,
         key: apiKey(),
         baseUrl: s.baseUrl,
@@ -1020,8 +1073,17 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
         return;
     }
     if (!apiKey()) {
-        log.warn('generation', `no API key configured — ${SKIP.NO_KEY}`);
-        return;
+        // m8 (R3-FINDINGS): the secret refresh kicked at GENERATION_STARTED is
+        // fire-and-forget, so the FIRST turn after a reload could see a stale
+        // empty key. Wait for it only in that case — everything time-critical
+        // (the token bump, the kind latch) is already done synchronously above.
+        if (stSecretStatus === 'unknown') {
+            await refreshSecretKey();
+        }
+        if (!apiKey()) {
+            log.warn('generation', `no usable API key — ${SKIP.NO_KEY} — ${apiKeyProblem()}`);
+            return;
+        }
     }
     // Phase 4 (S6): the goal counters and request expiries advance here — once
     // per real narrator turn, by script, before composition reads them.
@@ -1239,6 +1301,9 @@ async function injectIntoUnsafe(payload, shape) {
                         // A rejected attempt is a FAILURE and must be visible as one
                         // (phase 2: "failures are shown"), not a quiet info line.
                         log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                        if (!e.ok && /HTTP 40[13]/i.test(String(e.detail ?? ''))) {
+                            log.error('provider', 'AUTHENTICATION REJECTED (401/403) — the provider refused the API key. Fixes, in order: (1) open the Copilot settings and paste the key into the API key field — a stray space or quote breaks it (it is trimmed automatically now) — then press Save settings; (2) if the field is blank and the key lives in ST\'s OpenRouter secret instead, this server must have allowKeysExposure: true in config.yaml, otherwise extensions cannot read that secret at all. Send one more message after fixing.');
+                        }
                     } else {
                         log.info('pipeline', e.kind);
                     }
@@ -1722,14 +1787,15 @@ function installPanel() {
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>Copilot</b>
+                <span class="copilot-pilot" title="status light: green = active and running, red = off (disabled or no API key)">●</span>
                 <code class="copilot-build">build ${BUILD_ID}</code>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-up up"></div>
             </div>
             <div class="inline-drawer-content">
                 <div class="copilot-head">
-                    <button type="button" data-act="copy">Copy log</button>
-                    <button type="button" data-act="clear">Clear</button>
-                    <button type="button" data-act="toggle">Toggle</button>
+                    <button type="button" data-act="copy" title="Copy the whole debug log (unredacted copy is trimmed only by the clipboard) to the clipboard.">Copy log</button>
+                    <button type="button" data-act="clear" title="Empty the on-screen log. Nothing stored with the chat is touched.">Clear</button>
+                    <button type="button" data-act="toggle" title="Enable or disable the extension. Disabled = no extractor/composer calls, no injection. The pilot light turns red.">Toggle</button>
                 </div>
                 <pre class="copilot-body"></pre>
                 <div class="copilot-goals"></div>
@@ -1759,6 +1825,34 @@ function installPanel() {
         body.textContent = log.toText({ maxPerLine: 400 });
     };
 
+    // ---- Pilot light (user report: "add a pilot light that shows if it's
+    // active or not"). ONE glanceable lamp in the drawer header, driven by the
+    // same two gates the turn path uses (index.js `onGenerationStarted`):
+    //   GREEN = enabled AND a key resolves → the next narrator turn will run.
+    //   RED   = disabled, or no key from either source → turns are skipped.
+    // The tooltip names WHICH gate is closed, because "red" alone is not
+    // actionable. Never throws: the lamp is decoration and must not break the
+    // panel (I5).
+    const pilotEl = panel.querySelector('.copilot-pilot');
+    const renderPilot = () => {
+        try {
+            const s = settings();
+            const hasKey = Boolean(apiKey());
+            const on = Boolean(s.enabled) && hasKey;
+            pilotEl.classList.toggle('copilot-pilot-on', on);
+            pilotEl.classList.toggle('copilot-pilot-off', !on);
+            const why = !s.enabled
+                ? 'copilot is DISABLED — press Toggle above to enable it'
+                : (!hasKey
+                    ? (apiKeyProblem() || 'no API key')
+                    : `active — key from ${apiKeySource() === 'panel' ? 'the panel field' : 'ST\'s server secret'}, extractor + composer will run on the next narrator turn`);
+            pilotEl.title = `${on ? 'copilot is ON' : 'copilot is OFF'}: ${why}`;
+            pilotEl.setAttribute('aria-label', on ? 'copilot active' : 'copilot off');
+        } catch {
+            // Decoration only — a failure here must never take the panel down.
+        }
+    };
+
     // ---- Goals and user requests (phase 4, §6 / S6). The counters shown here
     // are the SCRIPT-tracked facts the composer receives — the model is never
     // asked to do the arithmetic.
@@ -1769,30 +1863,30 @@ function installPanel() {
             const goals = meta.goals ?? [];
             const requests = meta.requests ?? [];
             goalsEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>goals &amp; requests</strong></div>
+                <div class="copilot-gr-head" title="Goals and requests are script-tracked counters the composer is TOLD about — the model never counts turns itself."><strong>goals &amp; requests</strong></div>
                 <div class="copilot-gr-add">
-                    <input type="text" data-gr="goal-text" placeholder="goal (e.g. introduce Bob)" />
-                    <input type="text" data-gr="goal-turns" placeholder="turns (blank = forever)" size="12" />
-                    <button type="button" data-act="add-goal">Add goal</button>
+                    <input type="text" data-gr="goal-text" placeholder="goal (e.g. introduce Bob)" title="A long-running thing the story should move toward. Shown to the composer as {{copilot.goals}}." />
+                    <input type="text" data-gr="goal-turns" placeholder="turns (blank = forever)" size="12" title="How many narrator turns this goal stays active. Blank = never expires." />
+                    <button type="button" data-act="add-goal" title="Add this goal to the chat. Stored with the chat, not the extension settings.">Add goal</button>
                 </div>
                 <div class="copilot-gr-add">
-                    <input type="text" data-gr="req-text" placeholder="request (e.g. nudge toward the storm)" />
-                    <input type="text" data-gr="req-turns" placeholder="turns (blank = forever)" size="12" />
-                    <button type="button" data-act="add-request">Add request</button>
+                    <input type="text" data-gr="req-text" placeholder="request (e.g. nudge toward the storm)" title="A short-lived instruction for the next few turns. Shown to the composer as {{copilot.userRequest}}." />
+                    <input type="text" data-gr="req-turns" placeholder="turns (blank = forever)" size="12" title="How many turns this request stays active before it expires. Blank = never expires." />
+                    <button type="button" data-act="add-request" title="Add this request. It is counted down once per narrator turn by the script.">Add request</button>
                 </div>
                 ${goals.map((g) => {
                     const elapsed = Object.values(g.turnCounters ?? {}).reduce((a, b) => a + (Number(b) || 0), 0);
                     const remaining = g.remainingTurns === 'forever' ? 'no expiry' : `${Math.max(0, g.remainingTurns - elapsed)} left`;
-                    return `<div class="copilot-gr-item${g.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(g.id)}">
+                    return `<div class="copilot-gr-item${g.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(g.id)}" title="goal: ${escapeHtml(g.text)} — ${elapsed} turns elapsed, ${remaining}">
                         <span>${escapeHtml(g.text)} — ${elapsed} turns elapsed, ${remaining}${g.complete ? ' (complete)' : ''}</span>
-                        ${g.complete ? '' : '<button type="button" data-act="done-goal">Done</button>'}
+                        ${g.complete ? '' : '<button type="button" data-act="done-goal" title="Mark this goal complete so the composer stops seeing it as active.">Done</button>'}
                     </div>`;
                 }).join('')}
                 ${requests.map((r) => {
                     const remaining = r.remainingTurns === 'forever' ? 'forever' : `${Math.max(0, r.remainingTurns - (Number(r.turnsElapsed) || 0))} left`;
-                    return `<div class="copilot-gr-item${r.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(r.id)}">
+                    return `<div class="copilot-gr-item${r.complete ? ' copilot-gr-done' : ''}" data-id="${escapeHtml(r.id)}" title="request: ${escapeHtml(r.text)} — ${remaining}">
                         <span>${escapeHtml(r.text)} — ${remaining}${r.complete ? ' (expired)' : ''}</span>
-                        <button type="button" data-act="remove-request">Remove</button>
+                        <button type="button" data-act="remove-request" title="Delete this request now instead of waiting for it to expire.">Remove</button>
                     </div>`;
                 }).join('')}`;
         } catch (err) {
@@ -1833,17 +1927,17 @@ function installPanel() {
             const s = settings();
             const list = s.presets ?? [];
             presetsEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>presets</strong></div>
+                <div class="copilot-gr-head" title="A preset is a saved bundle of the extractor/composer configuration below. Applying one overwrites the current model chains, temperatures and templates."><strong>presets</strong></div>
                 <div class="copilot-gr-add">
-                    <select data-gr="preset-select">
+                    <select data-gr="preset-select" title="Pick a saved preset to apply or delete.">
                         ${list.map((p) => `<option value="${escapeHtml(p.id)}"${p.id === s.activePreset ? ' selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
                     </select>
-                    <button type="button" data-act="apply-preset">Apply</button>
-                    <button type="button" data-act="delete-preset">Delete</button>
+                    <button type="button" data-act="apply-preset" title="Load this preset's models, temperatures, token caps and prompt templates into the live settings.">Apply</button>
+                    <button type="button" data-act="delete-preset" title="Remove this preset from the list. The live settings are not changed.">Delete</button>
                 </div>
                 <div class="copilot-gr-add">
-                    <input type="text" data-gr="preset-name" placeholder="new preset name (saves the current config)" />
-                    <button type="button" data-act="save-preset">Save current as preset</button>
+                    <input type="text" data-gr="preset-name" placeholder="new preset name (saves the current config)" title="Name for a new preset — the CURRENT settings (chains, temperatures, caps, templates) are snapshotted under it." />
+                    <button type="button" data-act="save-preset" title="Snapshot the current configuration under the name on the left.">Save current as preset</button>
                 </div>`;
         } catch (err) {
             presetsEl.textContent = `presets unavailable: ${redact(String(err?.message ?? err))}`;
@@ -1885,14 +1979,14 @@ function installPanel() {
                     <span class="copilot-spend-total">${t.roles[role].tokensIn}/${t.roles[role].tokensOut} tok · $${t.roles[role].costUsd.toFixed(6)} · ${t.roles[role].calls} calls</span>
                 </div>`;
             spendEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>spend</strong> <em class="copilot-spend-note">provider-reported usage only; prices are per token, yours to edit</em></div>
+                <div class="copilot-gr-head" title="Token counts and cost come from the provider's own usage report — never estimated. The narrator line is what ST spent on the story model, reported here so the total is honest."><strong>spend</strong> <em class="copilot-spend-note">provider-reported usage only; prices are per token, yours to edit</em></div>
                 ${row('extractor')}
                 ${row('composer')}
                 ${row('narrator')}
                 <div class="copilot-gr-add">
-                    <span class="copilot-spend-role">combined</span>
+                    <span class="copilot-spend-role" title="All three roles combined.">combined</span>
                     <span class="copilot-spend-total">${t.combined.tokensIn}/${t.combined.tokensOut} tok · $${t.combined.costUsd.toFixed(6)} · ${t.combined.calls} calls</span>
-                    <button type="button" data-act="save-prices">Save prices</button>
+                    <button type="button" data-act="save-prices" title="Store the per-token prices above so the cost column is computed your way.">Save prices</button>
                 </div>`;
         } catch (err) {
             spendEl.textContent = `spend unavailable: ${redact(String(err?.message ?? err))}`;
@@ -1924,11 +2018,11 @@ function installPanel() {
             // mid-edit) — same guard as the transfer box.
             const keep = loreEl.querySelector('[data-gr="lore-keys"]')?.value;
             loreEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>lorebook</strong>
+                <div class="copilot-gr-head" title="Lorebook entries with names listed here are ALWAYS included in the composer's {{copilot.lorebook}} block, even when ST did not trigger them for this turn."><strong>lorebook</strong>
                     <em class="copilot-spend-note">permanently triggered keys (comma or newline separated) — always in the composer's lorebook block</em>
                 </div>
-                <textarea data-gr="lore-keys" rows="2" placeholder="e.g. turbine, ancient_map"></textarea>
-                <div class="copilot-gr-add"><button type="button" data-act="lore-save">Save</button></div>`;
+                <textarea data-gr="lore-keys" rows="2" placeholder="e.g. turbine, ancient_map" title="Entry NAMES from the active world info / lorebook, separated by commas or newlines. Entries with these names are treated as permanently triggered and always shown to the composer."></textarea>
+                <div class="copilot-gr-add"><button type="button" data-act="lore-save" title="Store these keys with the extension settings. The composer's lorebook block is rebuilt on every turn.">Save</button></div>`;
             const ta = loreEl.querySelector('[data-gr="lore-keys"]');
             if (ta) {
                 ta.value = keep ?? String(settings().permanentLoreKeys ?? '');
@@ -1957,35 +2051,35 @@ function installPanel() {
             const s = settings();
             const entries = collectExtractions(ctx().chat ?? []);
             compressEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>compressor</strong>
+                <div class="copilot-gr-head" title="When the visible fact list grows long, this merges old facts into one short block. The originals are never deleted — they are folded into history and stay auditable (I1/I2)."><strong>compressor</strong>
                     <em class="copilot-spend-note">merge a contiguous range; originals are kept and hidden (I1/I2)</em>
                 </div>
                 <div class="copilot-gr-add">
-                    <button type="button" data-act="compress-run">Compress selected</button>
-                    <button type="button" data-act="compress-undo">Undo last compression</button>
+                    <button type="button" data-act="compress-run" title="Merge the facts ticked below into one. Only a CONTIGUOUS ticked range can be merged.">Compress selected</button>
+                    <button type="button" data-act="compress-undo" title="Put the last merge back: the merged block is removed and its originals become visible again.">Undo last compression</button>
                 </div>
                 ${entries.map((e) => `
-                    <div class="copilot-gr-item" data-cidx="${e.extraction.id}">
-                        <label><input type="checkbox" data-csel="${e.extraction.id}" /> #${e.messageIndex}.${e.swipeIndex}</label>
+                    <div class="copilot-gr-item" data-cidx="${e.extraction.id}" title="extraction ${escapeHtml(String(e.extraction.id))} from message ${e.messageIndex}.${e.swipeIndex}">
+                        <label title="Tick to include in a compression. Only a contiguous run of ticks can be merged."><input type="checkbox" data-csel="${e.extraction.id}" /> #${e.messageIndex}.${e.swipeIndex}</label>
                         <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
-                        <button type="button" data-act="toggle-pin" data-ext-id="${e.extraction.id}">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
-                        <button type="button" data-act="toggle-protect" data-ext-id="${e.extraction.id}">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
+                        <button type="button" data-act="toggle-pin" data-ext-id="${e.extraction.id}" title="Pin = this fact can NEVER be merged away. Unpin to allow merging again.">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
+                        <button type="button" data-act="toggle-protect" data-ext-id="${e.extraction.id}" title="Protect = automatic merges skip this fact. Manual 'Compress selected' can still merge it.">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
                     </div>`).join('')}
                 <div class="copilot-gr-add">
-                    <label><input type="checkbox" data-cset="auto"${s.compress?.auto ? ' checked' : ''} /> auto-compress (default OFF — G2 gate)</label>
-                    <input type="text" data-cset="maxVisible" value="${escapeHtml(String(s.compress?.maxVisible ?? 40))}" size="4" title="merge only when more than this many exist" />
-                    <input type="text" data-cset="mergeCount" value="${escapeHtml(String(s.compress?.mergeCount ?? 10))}" size="4" title="how many oldest to merge" />
-                    <button type="button" data-act="compress-settings">Save</button>
-                    <button type="button" data-act="compress-auto">Run auto-compress now</button>
+                    <label title="Auto-compress (default OFF — the G2 review gates enabling it by default): when more facts exist than the threshold below, the oldest usable run is merged automatically"><input type="checkbox" data-cset="auto"${s.compress?.auto ? ' checked' : ''} /> auto-compress</label>
+                    <label title="Merge only when MORE than this many extractions are visible">merge above <input type="text" data-cset="maxVisible" value="${escapeHtml(String(s.compress?.maxVisible ?? 40))}" size="4" title="visible-extractions threshold (default 40)" /></label>
+                    <label title="How many of the OLDEST usable facts to merge at once">merge the oldest <input type="text" data-cset="mergeCount" value="${escapeHtml(String(s.compress?.mergeCount ?? 10))}" size="4" title="how many oldest to merge (default 10)" /></label>
+                    <button type="button" data-act="compress-settings" title="Save the auto-compress settings">Save</button>
+                    <button type="button" data-act="compress-auto" title="Merge the oldest usable run right now">Run auto-compress now</button>
                 </div>
                 ${(ctx().chatMetadata?.copilot?.snapshots ?? []).length ? `
-                <div class="copilot-gr-head"><strong>pre-op snapshots (I3)</strong>
+                <div class="copilot-gr-head" title="A snapshot taken before a compression, kept for rollback. Restoring is destructive to records created after it — you are asked first."><strong>pre-op snapshots (I3)</strong>
                     <em class="copilot-spend-note">restore returns to the snapshot — records created AFTER it are removed (you will be asked first)</em>
                 </div>
                 ${(ctx().chatMetadata?.copilot?.snapshots ?? []).map((snap, i) => `
                     <div class="copilot-gr-item">
                         <span class="copilot-c-text">snapshot ${i + 1} — ${(snap?.messages ?? []).length} recorded messages</span>
-                        <button type="button" data-act="restore-snap" data-snap="${i}">Restore</button>
+                        <button type="button" data-act="restore-snap" data-snap="${i}" title="Roll the chat's copilot data back to this snapshot. Asks for confirmation first.">Restore</button>
                     </div>`).join('')}` : ''}`;
         } catch (err) {
             compressEl.textContent = `compressor unavailable: ${redact(String(err?.message ?? err))}`;
@@ -2064,15 +2158,15 @@ function installPanel() {
             // export flow writes into it and then re-renders.
             const keep = transferEl.querySelector('[data-gr="transfer-json"]')?.value ?? '';
             transferEl.innerHTML = `
-                <div class="copilot-gr-head"><strong>import / export</strong>
+                <div class="copilot-gr-head" title="Copilot memory lives in the CHAT, not in the extension settings — this is how you carry it to another chat or machine. Imports are idempotent and a snapshot is kept first."><strong>import / export</strong>
                     <em class="copilot-spend-note">carry memory between chats (S9) — a snapshot is kept before every import</em>
                 </div>
                 <div class="copilot-gr-add">
-                    <button type="button" data-act="export-state">Export chat state</button>
-                    <button type="button" data-act="import-state">Import into this chat</button>
-                    <button type="button" data-act="restore-import">Restore pre-import snapshot</button>
+                    <button type="button" data-act="export-state" title="Write every copilot record in THIS chat (extractions, notes, injections, goals, spend) into the box below as JSON.">Export chat state</button>
+                    <button type="button" data-act="import-state" title="Merge the JSON in the box below into this chat. Existing records are kept; duplicates are skipped.">Import into this chat</button>
+                    <button type="button" data-act="restore-import" title="UNDO the last import by restoring the snapshot taken just before it. Asks for confirmation.">Restore pre-import snapshot</button>
                 </div>
-                <textarea data-gr="transfer-json" rows="4" placeholder="exported bundle JSON appears here; paste a bundle here to import it"></textarea>`;
+                <textarea data-gr="transfer-json" rows="4" placeholder="exported bundle JSON appears here; paste a bundle here to import it" title="The export button fills this with a JSON bundle; paste a bundle here and press Import."></textarea>`;
             const ta = transferEl.querySelector('[data-gr="transfer-json"]');
             if (ta && keep) {
                 ta.value = keep;
@@ -2142,6 +2236,59 @@ function installPanel() {
     // ---- The configuration surface (§6; critique F9/finding 2: every setting
     // used to be console-only while README promised fields). Every control here
     // is WIRED — no decorative inputs (trap 10).
+    // ---- Premade prompt templates (user report: "there seems to be none at the
+    // moment"). A bundle fills the three template boxes below; the boxes stay
+    // editable and NOTHING is saved until Save settings is pressed. All bundles
+    // keep the shipped extractor and compressor; only the NOTE VOICE differs,
+    // because that is the text the narrator actually reads. Every bundle keeps
+    // the shipped neutrality rule (§10.5): no judging, filtering or refusing.
+    const composerVariant = (extra) => `${DEFAULT_COMPOSER_PROMPT}\n\n${extra}`;
+    const PREMADE_TEMPLATES = [
+        {
+            id: 'default',
+            name: 'default — neutral guidance',
+            description: 'The shipped template: neutral prose note, 15–120 words, facts first, no padding. Extractor and compressor are the shipped ones.',
+        },
+        {
+            id: 'terse',
+            name: 'terse — short continuity notes',
+            description: 'For fast, chatty, or silly sessions. Notes stay near the LOW end of the word range and carry only what would break continuity if forgotten.',
+            composer: composerVariant(`BREVITY OVERRIDE
+Write near the LOW end of the word range: one or two sentences when the scene is
+simple. Carry only what would break continuity if forgotten — names, promises,
+objects, injuries, positions. Skip mood, skip scene-setting, skip anything the
+narrator can see in the last few messages.`),
+        },
+        {
+            id: 'detailed',
+            name: 'detailed — deep continuity',
+            description: 'For long, complex stories. Notes run near the HIGH end of the range and carry state later turns will need: knowledge, wants, promises, damage, positions, time.',
+            composer: composerVariant(`DEPTH OVERRIDE
+Write near the HIGH end of the word range. Beyond the current scene, carry the
+state that later turns will need: who knows what, who wants what, what was
+promised, what is broken or spent, where people are, what time it is. Prefer one
+more true fact over a longer description of one fact.`),
+        },
+        {
+            id: 'threads',
+            name: 'threads — open plots first',
+            description: 'For mystery, intrigue, and quest play. The note is ordered by open threads — unresolved questions, promises, threats, conflicting wants — so nothing is silently forgotten.',
+            composer: composerVariant(`THREADS OVERRIDE
+Order the note by open threads: unresolved questions, promises made, threats
+looming, wants in conflict. Name each thread concretely and say where it stands.
+A closed thread gets one line at most. The point of this note is that no thread
+is silently forgotten.`),
+        },
+        {
+            id: 'atmosphere',
+            name: 'atmosphere — mood continuity',
+            description: 'For mood-driven prose. Adds one or two established-fact sentences about light, weather, sound and distance, so the next scene keeps the same air.',
+            composer: composerVariant(`ATMOSPHERE OVERRIDE
+Add one or two sentences at the top: the mood of the place and moment as
+established so far — light, weather, sound, distance between people. State it as
+established fact, not as an instruction to generate feeling. Then the facts.`),
+        },
+    ];
     const settingsEl = panel.querySelector('.copilot-settings');
     const renderSettings = () => {
         try {
@@ -2159,64 +2306,96 @@ function installPanel() {
             };
             settingsEl.innerHTML = `
                 <div class="copilot-gr-head"><strong>settings</strong>
-                    <em class="copilot-spend-note">§6 configuration — chains are comma-separated; a blank key uses the ST secret</em>
+                    <em class="copilot-spend-note">every field saves with Save settings — the API key field is the reliable place for your key</em>
                 </div>
                 <div class="copilot-set-grid">
-                    <label>API key <input type="password" data-set="apiKey" placeholder="blank = use ST's OpenRouter secret (server-side)" /></label>
-                    <label>key storage <button type="button" data-act="settings-clear-key">Clear saved key</button>
-                        <em class="copilot-spend-note">a key typed here is stored PLAINTEXT in extension settings</em></label>
-                    <label>baseUrl <input type="text" data-set="baseUrl" /></label>
-                    <label>extractor chain <input type="text" data-set="extractorChain" /></label>
-                    <label>extractor temp / tokens <input type="text" data-set="extractorTemp" size="4" /> <input type="text" data-set="extractorMaxTokens" size="6" /></label>
-                    <label>composer chain <input type="text" data-set="composerChain" /></label>
-                    <label>composer temp / tokens <input type="text" data-set="composerTemp" size="4" /> <input type="text" data-set="composerMaxTokens" size="6" /></label>
-                    <label>note words min / max <input type="text" data-set="minWords" size="4" /> <input type="text" data-set="maxWords" size="4" /></label>
-                    <label>turn budget ms (maxWaitMs) <input type="text" data-set="maxWaitMs" size="7" /></label>
-                    <label>message window chars ext / comp <input type="text" data-set="extractorMaxChars" size="5" /> <input type="text" data-set="composerMaxChars" size="5" /></label>
-                    <label>reroll / swipe behavior
-                        <select data-set="rerollMode">
+                    <label title="The OpenRouter key this extension uses for its own model calls. Most reliable source: type it here. Blank = try ST's server-side OpenRouter secret, which only works when config.yaml has allowKeysExposure: true.">API key <input type="password" data-set="apiKey" title="Hand-typed keys are trimmed automatically. Typed here = always works. Blank = ST's OpenRouter secret (needs allowKeysExposure: true on the server)." placeholder="type the key here (most reliable)" /></label>
+                    <label title="A key typed above is stored PLAINTEXT in the extension settings file.">key storage <button type="button" data-act="settings-clear-key" class="copilot-danger">Clear saved key</button></label>
+                    <label title="OpenAI-compatible endpoint. Only change this for a different provider.">baseUrl <input type="text" data-set="baseUrl" title="https://openrouter.ai/api/v1 by default" /></label>
+                    <label title="Comma-separated model ids, tried in order — the extractor is the CHEAP per-turn fact recorder.">extractor chain <input type="text" data-set="extractorChain" title="e.g. inclusionai/ling-3.0-flash, dots-studio/dots-3-note-preview:free" /></label>
+                    <label title="Comma-separated model ids for the NOTE writer — the voice the narrator reads.">composer chain <input type="text" data-set="composerChain" title="e.g. qwen/qwen3.7-flash, sao10k/l3-lunaris-8b" /></label>
+                    <label title="Comma-separated model ids for merging old facts. Blank = the extractor chain.">compressor chain <input type="text" data-set="compressorChain" title="e.g. inclusionai/ling-3.0-flash" /></label>
+                    <label title="Sampling temperature per role. Extractor should stay low; composer higher.">temp extractor / composer <input type="text" data-set="extractorTemp" size="4" title="extractor temperature (0.2 default)" /> <input type="text" data-set="composerTemp" size="4" title="composer temperature (0.7 default)" /></label>
+                    <label title="Response token caps per role. Empty = automatic per-model budgets.">tokens extractor / composer <input type="text" data-set="extractorMaxTokens" size="6" title="empty = automatic per-model budget" /> <input type="text" data-set="composerMaxTokens" size="6" title="empty = automatic per-model budget" /></label>
+                    <label title="How many RECENT messages each role may read (the transcripts are counted in messages, not characters).">recent messages ext / comp <input type="text" data-set="extractorMaxMessages" size="4" title="extractor: how many recent messages (default 12)" /> <input type="text" data-set="composerMaxMessages" size="4" title="composer: how many recent messages (default 20)" /></label>
+                    <label title="Safety caps on the total transcript characters sent. Usually leave as-is.">safety chars ext / comp <input type="text" data-set="extractorMaxChars" size="5" title="safety cap, characters" /> <input type="text" data-set="composerMaxChars" size="5" title="safety cap, characters" /></label>
+                    <label title="Note length bounds. The minimum is a garbage floor (1-2 word answers are rejected); the maximum is hard.">note words min / max <input type="text" data-set="minWords" size="4" title="soft minimum — short real notes are accepted (default 15)" /> <input type="text" data-set="maxWords" size="4" title="hard maximum (default 120)" /></label>
+                    <label title="How long the whole extractor+composer step may take before the turn continues without a note.">turn budget ms <input type="text" data-set="maxWaitMs" size="7" title="maxWaitMs — a slow model never blocks the chat past this" /></label>
+                    <label title="What a swipe/regenerate does: ask you, always write a new note, or reuse the current one.">reroll / swipe behavior
+                        <select data-set="rerollMode" title="ask = popup; new = always compose; reuse = keep the current note">
                             <option value="ask">ask (popup)</option>
                             <option value="new">always compose new</option>
                             <option value="reuse">always reuse</option>
                         </select>
                     </label>
-                    <label><input type="checkbox" data-set="diffPopup" /> diff popup on rerolls</label>
-                    <label>injection position
-                        <select data-set="injectPosition">
+                    <label title="On a reroll, show old vs new extraction and note before choosing."><input type="checkbox" data-set="diffPopup" /> diff popup on rerolls</label>
+                    <label title="Where the &lt;copilot&gt; note goes in the prompt. 'none' = compose and store but never send.">injection position
+                        <select data-set="injectPosition" title="end / before the last message / first / none (log only)">
                             <option value="end">end of the prompt</option>
                             <option value="before_last">before the last message</option>
                             <option value="first">first</option>
                             <option value="none">none (log only)</option>
                         </select>
                     </label>
-                    <label>injection depth / role
-                        <input type="text" data-set="injectDepth" size="3" title="in_chat depth: how many messages from the end" />
-                        <select data-set="injectRole">
+                    <label title="Registry depth (messages from the end) and the role the note is delivered as.">injection depth / role
+                        <input type="text" data-set="injectDepth" size="3" title="depth: how many messages from the end" />
+                        <select data-set="injectRole" title="the role the note appears as">
                             <option value="system">system</option>
                             <option value="user">user</option>
                             <option value="assistant">assistant</option>
                         </select>
                     </label>
                 </div>
-                <details><summary>prompt templates (namespaced {{copilot.*}} blocks)</summary>
-                    <label>extractor <textarea data-set="promptExtractor" rows="5"></textarea></label>
-                    <label>composer <textarea data-set="promptComposer" rows="5"></textarea></label>
-                    <label>compressor <textarea data-set="promptCompressor" rows="5"></textarea></label>
+                <details class="copilot-help"><summary>what can be injected / what the prompts can mention</summary>
+                    <p><strong>The note</strong> (the only thing injected into the narrator's prompt) is delivered
+                    at the configured position/depth/role above — on chat-completions via ST's extension-prompt registry.</p>
+                    <p><strong>Prompts can mention</strong> (namespaced blocks — they never collide with ST's own macros):</p>
+                    <ul>
+                        <li><code>{{copilot.extractions}}</code> — the durable facts recorded so far</li>
+                        <li><code>{{copilot.lastMessages}}</code> — the recent transcript window</li>
+                        <li><code>{{copilot.lorebook}}</code> — triggered + permanently-triggered lorebook entries</li>
+                        <li><code>{{copilot.characterCard}}</code>, <code>{{copilot.narratorPrompt}}</code> — the character name and the narrator's standing instructions</li>
+                        <li><code>{{copilot.userRequest}}</code>, <code>{{copilot.goals}}</code> — active requests and goals (with script-counted turns)</li>
+                        <li><code>{{copilot.previousNote}}</code> — the note the composer must not simply repeat</li>
+                        <li><code>{{copilot.language}}</code>, <code>{{copilot.minWords}}</code>, <code>{{copilot.maxWords}}</code></li>
+                    </ul>
+                    <p>Templates below come PRE-FILLED with the shipped defaults — editing one overrides it;
+                    clearing a box and saving restores the built-in template.</p>
+                </details>
+                <details open><summary>prompt templates (pre-filled with the active templates)</summary>
+                    <div class="copilot-tpl-row">
+                        <label title="Ready-made bundles of the three templates below. Loading one only fills the boxes — press Save settings to actually apply it.">premade templates
+                            <select data-set="templatePick" title="Pick a bundle, then press 'Load into boxes'. Nothing changes until you press Save settings.">
+                                ${PREMADE_TEMPLATES.map((t) => `<option value="${escapeHtml(t.id)}"${(keep.templatePick ?? 'default') === t.id ? ' selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
+                            </select>
+                            <button type="button" data-act="template-load" title="Fill the three template boxes below with the selected bundle. Review or edit them, then press Save settings.">Load into boxes</button>
+                        </label>
+                        <div class="copilot-tpl-desc" title="What this bundle is for.">${escapeHtml(PREMADE_TEMPLATES.find((t) => t.id === (keep.templatePick ?? 'default'))?.description ?? PREMADE_TEMPLATES[0].description)}</div>
+                    </div>
+                    <label>extractor <textarea data-set="promptExtractor" rows="6" title="What the fact recorder sees. The transcript is appended as the user turn."></textarea></label>
+                    <label>composer <textarea data-set="promptComposer" rows="6" title="What the note writer sees. Use the {{copilot.*}} blocks above."></textarea></label>
+                    <label>compressor <textarea data-set="promptCompressor" rows="6" title="What the merge model sees. Output must be inside <compressed>...</compressed> tags and shorter than its input."></textarea></label>
+                    <div class="copilot-gr-add">
+                        <button type="button" data-act="settings-defaults">Restore default templates</button>
+                    </div>
                 </details>
                 <div class="copilot-gr-add"><button type="button" data-act="settings-save">Save settings</button></div>`;
             put('apiKey', '');
             put('baseUrl', s.baseUrl ?? '');
             put('extractorChain', (s.extractor?.chain ?? []).join(', '));
-            put('extractorTemp', s.extractor?.temperature ?? 0.2);
-            put('extractorMaxTokens', s.extractor?.maxTokens ?? '');
             put('composerChain', (s.composer?.chain ?? []).join(', '));
+            put('compressorChain', (s.compressorChain ?? []).join(', '));
+            put('extractorTemp', s.extractor?.temperature ?? 0.2);
             put('composerTemp', s.composer?.temperature ?? 0.7);
+            put('extractorMaxTokens', s.extractor?.maxTokens ?? '');
             put('composerMaxTokens', s.composer?.maxTokens ?? '');
+            put('extractorMaxMessages', s.extractor?.maxMessages ?? 12);
+            put('composerMaxMessages', s.composer?.maxMessages ?? 20);
+            put('extractorMaxChars', s.extractor?.maxChars ?? 6000);
+            put('composerMaxChars', s.composer?.maxChars ?? 8000);
             put('minWords', s.composer?.minWords ?? 15);
             put('maxWords', s.composer?.maxWords ?? 120);
             put('maxWaitMs', s.maxWaitMs ?? 60000);
-            put('extractorMaxChars', s.extractor?.maxChars ?? 6000);
-            put('composerMaxChars', s.composer?.maxChars ?? 8000);
             put('rerollMode', s.rerollMode ?? 'ask');
             const dp = settingsEl.querySelector('[data-set="diffPopup"]');
             if (dp) {
@@ -2225,16 +2404,35 @@ function installPanel() {
             put('injectPosition', s.injection?.position ?? 'end');
             put('injectDepth', s.injection?.depth ?? 0);
             put('injectRole', s.injection?.role ?? 'system');
-            put('promptExtractor', s.extractor?.prompt ?? '');
-            put('promptComposer', s.composer?.prompt ?? '');
-            put('promptCompressor', s.compressorPrompt ?? '');
+            // Templates are PRE-FILLED with the ACTIVE text (default when unset)
+            // — empty boxes looked like "there are no templates" (user report).
+            put('promptExtractor', s.extractor?.prompt ?? DEFAULT_EXTRACTOR_PROMPT);
+            put('promptComposer', s.composer?.prompt ?? DEFAULT_COMPOSER_PROMPT);
+            put('promptCompressor', s.compressorPrompt ?? DEFAULT_COMPRESSOR_PROMPT);
         } catch (err) {
             settingsEl.textContent = `settings unavailable: ${redact(String(err?.message ?? err))}`;
         }
     };
     settingsEl.addEventListener('click', (ev) => {
-        const btn = ev.target.closest?.('button[data-act="settings-save"], button[data-act="settings-clear-key"]');
+        const btn = ev.target.closest?.('button[data-act="settings-save"], button[data-act="settings-clear-key"], button[data-act="settings-defaults"], button[data-act="template-load"]');
         if (!btn) {
+            return;
+        }
+        // Premade template bundle -> fill the boxes (NOT saved yet).
+        if (btn.dataset.act === 'template-load') {
+            const id = String(settingsEl.querySelector('[data-set="templatePick"]')?.value ?? 'default');
+            const tpl = PREMADE_TEMPLATES.find((t) => t.id === id) ?? PREMADE_TEMPLATES[0];
+            const box = (name, v) => {
+                const el = settingsEl.querySelector(`[data-set="${name}"]`);
+                if (el) {
+                    el.value = v;
+                }
+            };
+            box('promptExtractor', tpl.extractor ?? DEFAULT_EXTRACTOR_PROMPT);
+            box('promptComposer', tpl.composer ?? DEFAULT_COMPOSER_PROMPT);
+            box('promptCompressor', tpl.compressor ?? DEFAULT_COMPRESSOR_PROMPT);
+            log.info('settings', `template "${tpl.name}" loaded into the boxes — press Save settings to apply it`);
+            render();
             return;
         }
         // T-R2-9: there used to be NO way to remove a stored key.
@@ -2244,7 +2442,24 @@ function installPanel() {
             if (input) {
                 input.value = '';
             }
-            log.info('settings', 'saved API key cleared — the ST server-side secret is used if present');
+            log.info('settings', `saved API key cleared — the panel key is gone; ST's OpenRouter secret is used instead if this server exposes it (allowKeysExposure). Status: ${stSecretStatus}`);
+            renderSettings();
+            renderPilot();
+            render();
+            return;
+        }
+        // Restore the built-in prompt templates (the boxes are pre-filled with
+        // the ACTIVE text — user report: empty boxes looked like no templates).
+        if (btn.dataset.act === 'settings-defaults') {
+            const s0 = settings();
+            saveSettings({
+                extractor: { ...s0.extractor, prompt: undefined },
+                composer: { ...s0.composer, prompt: undefined },
+                compressorPrompt: undefined,
+            });
+            log.info('settings', 'prompt templates reset to the shipped defaults');
+            renderSettings();
+            render();
             return;
         }
         try {
@@ -2258,12 +2473,14 @@ function installPanel() {
                 maxWaitMs: num(get('maxWaitMs'), 60000),
                 rerollMode: get('rerollMode') || 'ask',
                 diffPopup: Boolean(settingsEl.querySelector('[data-set="diffPopup"]')?.checked),
+                compressorChain: chain(get('compressorChain')),
                 extractor: {
                     ...s.extractor,
                     chain: chain(get('extractorChain')),
                     temperature: num(get('extractorTemp'), 0.2),
                     maxTokens: num(get('extractorMaxTokens'), undefined),
                     maxChars: num(get('extractorMaxChars'), 6000),
+                    maxMessages: num(get('extractorMaxMessages'), 12),
                     // m2: an EMPTY box means "use the built-in template" — the
                     // old `? :` silently kept the previous prompt (trap 10).
                     prompt: get('promptExtractor') || undefined,
@@ -2276,6 +2493,7 @@ function installPanel() {
                     minWords: num(get('minWords'), 15),
                     maxWords: num(get('maxWords'), 120),
                     maxChars: num(get('composerMaxChars'), 8000),
+                    maxMessages: num(get('composerMaxMessages'), 20),
                     prompt: get('promptComposer') || undefined,
                 },
                 injection: {
@@ -2286,9 +2504,22 @@ function installPanel() {
                 },
                 compressorPrompt: get('promptCompressor') || undefined,
             });
-            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} models in the chains)`);
+            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models)`);
+            renderPilot();
         } catch (err) {
             log.warn('settings', `save failed: ${redact(String(err?.message ?? err))}`);
+        }
+    });
+    // The premade-template description follows the dropdown live (no save
+    // needed — it is explanatory text only).
+    settingsEl.addEventListener('change', (ev) => {
+        if (ev.target?.dataset?.set !== 'templatePick') {
+            return;
+        }
+        const tpl = PREMADE_TEMPLATES.find((t) => t.id === String(ev.target.value));
+        const desc = settingsEl.querySelector('.copilot-tpl-desc');
+        if (tpl && desc) {
+            desc.textContent = tpl.description;
         }
     });
 
@@ -2318,32 +2549,32 @@ function installPanel() {
             // Trap 8 (T-R2-12): store size is VISIBLE — a silent cap is data
             // loss; an honest size line is not.
             const totalBytes = entries.reduce((n, e) => n + JSON.stringify(e.record ?? {}).length, 0);
-            const sizeLine = `<div class="copilot-record-empty">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</div>`;
+            const sizeLine = `<div class="copilot-record-empty" title="One card per message/swipe that has copilot data. Record sizes are always reported — never silently capped.">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</div>`;
             recordsEl.innerHTML = sizeLine + entries.map((e, i) => {
                 const rec = e.record;
                 const stale = rec.composer?.staleFlag === true;
                 return `
-                <div class="copilot-record" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
+                <div class="copilot-record" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}" title="Stored copilot record for message ${e.messageIndex}, swipe ${e.swipeIndex}. Kept in the chat file.">
                     <div class="copilot-record-head">
                         <strong>message ${e.messageIndex} · swipe ${e.swipeIndex}</strong>
-                        ${i === latestIdx && latestAt > 0 ? '<em class="copilot-badge copilot-badge-latest">last injected note</em>' : ''}
-                        ${e.isCurrentSwipe ? '<em class="copilot-badge">current swipe</em>' : ''}
-                        ${rec.composer?.edited ? '<em class="copilot-badge">note edited</em>' : ''}
-                        ${rec.extraction?.edited ? '<em class="copilot-badge">extraction edited</em>' : ''}
-                        ${stale ? `<em class="copilot-warn">⚠ ${escapeHtml(rec.composer.staleReason ?? 'extraction changed, may not match')}</em>` : ''}
+                        ${i === latestIdx && latestAt > 0 ? '<em class="copilot-badge copilot-badge-latest" title="The most recently injected note in this chat.">last injected note</em>' : ''}
+                        ${e.isCurrentSwipe ? '<em class="copilot-badge" title="This record belongs to the swipe currently shown in the chat.">current swipe</em>' : ''}
+                        ${rec.composer?.edited ? '<em class="copilot-badge" title="The note was hand-edited in this panel.">note edited</em>' : ''}
+                        ${rec.extraction?.edited ? '<em class="copilot-badge" title="The extraction was hand-edited in this panel.">extraction edited</em>' : ''}
+                        ${stale ? `<em class="copilot-warn" title="The extraction changed after this note was written, so the note may not match it any more.">⚠ ${escapeHtml(rec.composer.staleReason ?? 'extraction changed, may not match')}</em>` : ''}
                     </div>
-                    <label>extraction</label>
-                    <textarea data-field="extraction" rows="3">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
-                    <button type="button" data-act="save-extraction">Save extraction</button>
-                    <label>composer note</label>
-                    <textarea data-field="composer" rows="3">${escapeHtml(rec.composer?.text ?? '')}</textarea>
-                    <button type="button" data-act="save-note">Save note</button>
+                    <label title="The durable facts the extractor recorded from this turn. Editing it flags the note as possibly stale.">extraction</label>
+                    <textarea data-field="extraction" rows="3" title="Extracted facts for this turn. Edit and press Save extraction to keep the change.">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
+                    <button type="button" data-act="save-extraction" title="Store this edited extraction. The matching note is flagged as possibly stale.">Save extraction</button>
+                    <label title="The &lt;copilot&gt; guidance note that was injected into the narrator's prompt for this turn.">composer note</label>
+                    <textarea data-field="composer" rows="3" title="The guidance note written by the composer. Edit and press Save note to keep the change.">${escapeHtml(rec.composer?.text ?? '')}</textarea>
+                    <button type="button" data-act="save-note" title="Store this edited note. Nothing already sent to the model changes.">Save note</button>
                     ${rec.trace ? `
-                    <details class="copilot-trace"><summary>audit trace — what was actually sent (survives reloads)</summary>
-                        <label>extractor input</label><pre>${escapeHtml(String(rec.trace.extractorIn ?? ''))}</pre>
-                        <label>extractor output</label><pre>${escapeHtml(String(rec.trace.extractorOut ?? ''))}</pre>
-                        <label>composer input</label><pre>${escapeHtml(String(rec.trace.composerIn ?? ''))}</pre>
-                        <label>composer output</label><pre>${escapeHtml(String(rec.trace.composerOut ?? ''))}</pre>
+                    <details class="copilot-trace"><summary title="The exact text sent to and returned from the models for this turn, so you can audit what happened.">audit trace — what was actually sent (survives reloads)</summary>
+                        <label title="The prompt text the extractor model received.">extractor input</label><pre>${escapeHtml(String(rec.trace.extractorIn ?? ''))}</pre>
+                        <label title="The raw extractor model response.">extractor output</label><pre>${escapeHtml(String(rec.trace.extractorOut ?? ''))}</pre>
+                        <label title="The prompt text the composer model received.">composer input</label><pre>${escapeHtml(String(rec.trace.composerIn ?? ''))}</pre>
+                        <label title="The raw composer model response.">composer output</label><pre>${escapeHtml(String(rec.trace.composerOut ?? ''))}</pre>
                     </details>` : ''}
                 </div>`;
             }).join('');
@@ -2393,10 +2624,12 @@ function installPanel() {
         const s = settings();
         saveSettings({ enabled: !s.enabled });
         log.info('panel', `copilot ${!s.enabled ? 'enabled' : 'disabled'}`);
+        renderPilot();
         render();
     });
     log.subscribe(() => {
         render();
+        renderPilot();
         // Refresh the browser/goals/spend unless the user is typing in them.
         if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
             && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)
@@ -2421,6 +2654,7 @@ function installPanel() {
     renderCompress();
     renderTransfer();
     renderSettings();
+    renderPilot();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 

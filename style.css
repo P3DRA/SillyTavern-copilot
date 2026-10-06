@@ -8,6 +8,12 @@
     font-family: var(--fontFamily, sans-serif);
     font-size: 12px;
     color: var(--SmartThemeBodyColor, #ddd);
+    /* User report: "settings area is wider than an extension should be". The
+       panel must never exceed the Extensions drawer it lives in. */
+    box-sizing: border-box;
+    max-width: 100%;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .copilot-panel .inline-drawer-header {
@@ -22,6 +28,47 @@
     /* Trap 20: the build id must be impossible to miss, because "the fix is not
        live" is the most common false conclusion. */
     color: #7fd67f;
+}
+
+/* ---- Pilot light (user request) -------------------------------------------
+   One lamp in the drawer header: GREEN = the extension is enabled AND a key
+   resolves, so the next narrator turn will actually run the pipeline; RED =
+   off. `cursor: help` + a dynamic `title` (set in index.js renderPilot) say
+   WHICH gate is closed — a bare red dot is not actionable. */
+.copilot-pilot {
+    font-size: 13px;
+    line-height: 1;
+    color: #9aa0a6;
+    cursor: help;
+    text-shadow: 0 0 4px currentColor;
+}
+
+.copilot-pilot-on {
+    color: #4ade80;
+}
+
+.copilot-pilot-off {
+    color: #ef4444;
+}
+
+/* Destructive controls must be READABLE (user report: "Clear saved key button's
+   text is very hard to read" — it inherited the theme's faint button colour on
+   a dark background). Explicit colours, not theme-dependent. */
+.copilot-danger {
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    color: #ffc9c9;
+    background: rgba(150, 35, 35, 0.35);
+    border: 1px solid #b04a4a;
+    border-radius: 3px;
+    padding: 1px 8px;
+    cursor: pointer;
+}
+
+.copilot-danger:hover {
+    color: #ffffff;
+    background: rgba(190, 50, 50, 0.55);
 }
 
 .copilot-head {
@@ -189,9 +236,17 @@
 /* ---- The settings section (§6 configuration surface) ---- */
 .copilot-set-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* User report: the settings block was wider than the drawer. Fixed 1fr/1fr
+       tracks plus `white-space: nowrap` labels forced horizontal overflow, so
+       the grid now collapses to ONE column on a narrow drawer and the labels
+       wrap instead of pushing the panel out. minmax(0,…) stops a long input or
+       model-id list from inflating its track. */
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
     gap: 4px 10px;
     margin: 6px 0;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
 }
 
 .copilot-set-grid label {
@@ -199,7 +254,15 @@
     align-items: center;
     gap: 4px;
     font-size: 11px;
-    white-space: nowrap;
+    min-width: 0;
+    flex-wrap: wrap;
+    white-space: normal;
+}
+
+.copilot-settings {
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
 }
 
 .copilot-settings input[type="text"],
@@ -207,6 +270,8 @@
 .copilot-settings select {
     flex: 1;
     min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
     font: inherit;
     font-size: 11px;
     color: inherit;
@@ -233,6 +298,31 @@
 
 .copilot-settings summary {
     cursor: pointer;
+    font-size: 11px;
+    opacity: 0.85;
+}
+
+/* Premade prompt-template picker: the bundle row plus a live one-line
+   description of what the selected bundle is for. */
+.copilot-tpl-row {
+    margin: 6px 0;
+    padding: 4px 6px;
+    border: 1px dashed var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+}
+
+.copilot-tpl-row label {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-width: 0;
+    font-size: 11px;
+    white-space: normal;
+}
+
+.copilot-tpl-desc {
+    margin-top: 3px;
     font-size: 11px;
     opacity: 0.85;
 }
