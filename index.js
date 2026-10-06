@@ -32,6 +32,7 @@ import { mergeLoreEntries } from './src/core/prompts.js';
 import { applyComposerEdit, applyExtractionEdit } from './src/schema/edit.js';
 import {
     noteHash, goalFacts, tickGoals, tickRequests, makeGoal, makeUserRequest,
+    noteTextOf, pushSnapshot,
 } from './src/schema/records.js';
 import { emptySpend, recordSpend, spendSummary } from './src/core/spend.js';
 import {
@@ -42,11 +43,10 @@ import {
 } from './src/core/compressor.js';
 import { exportChatState, importChatState, restoreImport } from './src/schema/transfer.js';
 import { callWithFallback } from './src/core/provider.js';
-import { pushSnapshot } from './src/schema/records.js';
 import { redact } from './src/core/redact.js';
 import {
     ctx, chat, eventSource, saveChatConditional, saveMetadata,
-    nextToken, isCurrent, resetTokens, clearPending,
+    nextToken, resetTokens, clearPending,
     setPending, getPending, bindToMessage, recordSkip, registerNote, clearNote,
     hasPendingSkip, currentTokenValue,
 } from './src/st/adapter.js';
@@ -307,11 +307,7 @@ async function readPermanentLorebook() {
     }
 }
 
-function noteTextOf(record) {
-    const t = record?.composer?.text;
-    return typeof t === 'string' && t.trim() !== '' ? t : null;
-}
-
+// noteTextOf now comes from src/schema/records.js (R2-27: it was duplicated).
 function previousNoteFor(list) {
     for (let i = list.length - 1; i >= 0; i -= 1) {
         const m = list[i];
@@ -1454,12 +1450,16 @@ function maybeAutoCompress() {
         if (!s.compress?.auto) {
             return;
         }
-        const visible = collectExtractions(chat()).length;
+        const entries = collectExtractions(chat());
         const threshold = s.compress?.maxVisible ?? 40;
-        if (visible <= threshold) {
+        // R2-31: decide with autoSelect's notion of MERGEABLE (usable run), not
+        // a raw visible count — the mismatch spammed "nothing to merge" every
+        // turn once entries were protected/pinned.
+        const would = autoSelect(entries, { maxVisible: threshold, mergeCount: s.compress?.mergeCount ?? 10 });
+        if (would.length < 2) {
             return;
         }
-        log.info('compress', `auto: ${visible} visible > ${threshold} — merging the oldest usable run`);
+        log.info('compress', `auto: ${entries.length} visible — merging the ${would.length} oldest usable`);
         runAutoCompression().catch((err) => {
             log.warn('compress', `auto-compress failed: ${redact(String(err?.message ?? err))}`);
         });
@@ -2002,7 +2002,29 @@ function installPanel() {
                 importStateFromBundle(state);
             }
         } else if (btn.dataset.act === 'restore-import') {
-            restorePreImport();
+            // T-R2-14: restore is destructive for post-import records — ask,
+            // with the benign timeout answer 'no'.
+            let answer = 'no';
+            try {
+                const PopupCls = ctx().Popup;
+                if (PopupCls?.show?.confirm) {
+                    answer = await popupWithTimeout(
+                        PopupCls.show.confirm(
+                            'Restore pre-import snapshot',
+                            'This REMOVES the records the import added. Continue?',
+                            { okButton: 'Restore', cancelButton: 'Keep them' },
+                        ).then((r) => (r === 1 ? 'yes' : 'no')),
+                        20000, 'no', 'restore-import confirm',
+                    );
+                }
+            } catch {
+                answer = 'no';
+            }
+            if (answer === 'yes') {
+                restorePreImport();
+            } else {
+                log.info('transfer', 'restore cancelled — nothing changed');
+            }
         }
         renderTransfer();
         render();

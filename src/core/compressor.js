@@ -155,12 +155,29 @@ export function autoSelect(entries, opts = {}) {
  * @returns {{ok: boolean, reason: string|null, merged: object|null, originals: object[]}}
  */
 export function commitCompression(chat, entries, mergedText, meta = {}) {
-    const sel = validateSelection((entries ?? []).map((_, i) => i));
-    if (!sel.ok) {
-        return { ok: false, reason: sel.reason, merged: null, originals: [] };
+    // R2-30: REAL checks at commit time. The old "contiguity" check mapped the
+    // entries to 0..n-1 and validated that sequence — always true for n>=2.
+    // Duplicates, id-less entries and already-compressed entries can actually
+    // happen and must be refused (I2: never a double-merge).
+    const ids = new Set();
+    for (const e of (entries ?? [])) {
+        const ex = e?.extraction;
+        if (!ex || !ex.id) {
+            return { ok: false, reason: 'selection contains an entry without an id', merged: null, originals: [] };
+        }
+        if (ids.has(ex.id)) {
+            return { ok: false, reason: 'selection contains a duplicate entry', merged: null, originals: [] };
+        }
+        if (ex.compressedInto) {
+            return { ok: false, reason: 'selection contains an already-compressed entry', merged: null, originals: [] };
+        }
+        ids.add(ex.id);
+    }
+    if (ids.size < 2) {
+        return { ok: false, reason: 'a merge needs at least two entries', merged: null, originals: [] };
     }
     const originals = (entries ?? []).map((e) => e?.extraction).filter(Boolean);
-    if (originals.length !== (entries ?? []).length || originals.length < 2) {
+    if (originals.length !== (entries ?? []).length) {
         return { ok: false, reason: 'invalid selection entries', merged: null, originals: [] };
     }
     // I3: snapshot BEFORE the bulk operation — restore must be able to undo
