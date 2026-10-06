@@ -256,7 +256,11 @@ export function coerceSwipeRecord(raw) {
     // would vanish on the next read, which is exactly how the torture test
     // caught it). Valid parts keep their identity and only get defaults
     // filled in; invalid parts are rebuilt.
-    if (raw.extraction && typeof raw.extraction === 'object' && isNonEmptyString(raw.extraction.text)) {
+    //
+    // F2 (critique round 1): an EMPTY-text extraction/composer is PROVENANCE,
+    // not garbage — a failed turn's record keeps its model/tokens/attempts
+    // (I1). Only an object without a text field at all is "no data".
+    if (raw.extraction && typeof raw.extraction === 'object' && typeof raw.extraction.text === 'string') {
         Object.assign(raw.extraction, makeExtraction(raw.extraction));
         rec.extraction = raw.extraction;
     }
@@ -265,7 +269,7 @@ export function coerceSwipeRecord(raw) {
     // them (the unknown-key sweep) and compression would silently lose its own
     // output.
     if (Array.isArray(raw.extractions)) {
-        const kept = raw.extractions.filter((e) => e && typeof e === 'object' && isNonEmptyString(e.text));
+        const kept = raw.extractions.filter((e) => e && typeof e === 'object' && typeof e.text === 'string');
         for (const e of kept) {
             Object.assign(e, makeExtraction(e));
         }
@@ -273,7 +277,7 @@ export function coerceSwipeRecord(raw) {
             rec.extractions = kept;
         }
     }
-    if (raw.composer && typeof raw.composer === 'object' && isNonEmptyString(raw.composer.text)) {
+    if (raw.composer && typeof raw.composer === 'object' && typeof raw.composer.text === 'string') {
         Object.assign(raw.composer, makeComposer(raw.composer));
         rec.composer = raw.composer;
     }

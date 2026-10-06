@@ -240,7 +240,10 @@ export function undoCompressionAt(chat, merged) {
         return { ok: false, reason: 'nothing to undo' };
     }
     const originals = [];
-    // Walk every record (including hidden originals) to find the sources.
+    const mergedSlots = [];
+    // Walk every record (including hidden originals) to find the sources —
+    // FIRST PASS ONLY. I4 (F7, critique round 1): validate BEFORE mutating. A
+    // partial state (a source message deleted) must change NOTHING.
     for (let mi = 0; mi < (chat?.length ?? 0); mi += 1) {
         const msg = chat[mi];
         const infos = Array.isArray(msg?.swipe_info) ? msg.swipe_info : [];
@@ -258,16 +261,17 @@ export function undoCompressionAt(chat, merged) {
                     originals.push({ ex, mi, si });
                 }
             }
-            if (Array.isArray(rec.extractions)) {
-                const has = rec.extractions.some((e) => e && e.id === merged.id);
-                if (has) {
-                    removeExtraExtraction(msg, si, merged.id);
-                }
+            if (Array.isArray(rec.extractions) && rec.extractions.some((e) => e && e.id === merged.id)) {
+                mergedSlots.push({ msg, si });
             }
         }
     }
     if (originals.length !== merged.sources.length) {
-        return { ok: false, reason: `undo found ${originals.length} of ${merged.sources.length} originals` };
+        return { ok: false, reason: `undo found ${originals.length} of ${merged.sources.length} originals — nothing changed` };
+    }
+    // SECOND PASS: only now touch anything.
+    for (const slot of mergedSlots) {
+        removeExtraExtraction(slot.msg, slot.si, merged.id);
     }
     undoCompression(originals.map((o) => o.ex));
     // Refresh the mirrors AFTER the marks are cleared — refreshing earlier

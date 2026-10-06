@@ -161,11 +161,12 @@ export function readSwipeRecordOrNull(message, swipeIndex) {
         return null;
     }
     const normalised = coerceSwipeRecord(root.record);
-    for (const key of Object.keys(root.record)) {
-        if (!(key in normalised)) {
-            delete root.record[key];
-        }
-    }
+    // F8 (critique round 1): there used to be an unknown-key SWEEP here that
+    // deleted every top-level field the current schema did not know — silently
+    // destroying a record written by a newer build on every read (I1, and the
+    // exact opposite of migrate.js's own rule "carry anything unknown through
+    // untouched"). Unknown keys now ride along untouched; migration owns
+    // normalisation.
     Object.assign(root.record, normalised);
     return root.record;
 }
