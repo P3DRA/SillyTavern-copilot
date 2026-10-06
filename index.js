@@ -973,6 +973,11 @@ async function injectIntoUnsafe(payload, shape) {
     let note = null;
     let composerRecord = null;
     let extractionRecord = null;
+    // Hoisted out of the compose loop — setPending runs outside it (a batch-1
+    // edit referenced `input` there and threw "input is not defined" on EVERY
+    // turn: caught live by the S1 scenario run).
+    let activeGoalIds = [];
+    let activeRequestIds = [];
 
     // Phase 3: the popup's "reuse the current one" — no model call, the note
     // goes in again, and the record SAYS it was reused instead of pretending a
@@ -1051,6 +1056,8 @@ async function injectIntoUnsafe(payload, shape) {
             turn.composer = composed.composer;
             turn.pipelineMs = composed.elapsedMs ?? null;
             lastNote = note;
+            activeGoalIds = input.goalIds ?? [];
+            activeRequestIds = input.requestIds ?? [];
 
             // Phase 4 (§6): the diff popup on rerolls — old vs new extraction
             // and note, four options. Only when there IS an old note to diff
@@ -1114,8 +1121,8 @@ async function injectIntoUnsafe(payload, shape) {
         position: opts.position,
         extraction: extractionRecord,
         composer: composerRecord,
-        goalIds: input.goalIds ?? [],
-        requestIds: input.requestIds ?? [],
+        goalIds: activeGoalIds,
+        requestIds: activeRequestIds,
         model: composerRecord?.model,
         tokensIn: composerRecord?.tokensIn,
         tokensOut: composerRecord?.tokensOut,
