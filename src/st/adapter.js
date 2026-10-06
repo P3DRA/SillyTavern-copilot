@@ -248,14 +248,30 @@ export function bindToMessage(token) {
         return { bound: false, messageIndex: -1, swipeIndex: -1, reason: SKIP.STALE_GENERATION };
     }
     const list = chat();
-    if (!Array.isArray(list) || list.length === 0) {
-        return { bound: false, messageIndex: -1, swipeIndex: -1, reason: SKIP.NO_NOTE };
+    if (!Array.isArray(list) || list.length === 0 || list[list.length - 1]?.is_user) {
+        // T-R2-6 (I1, trap 14): taken data must NEVER leave without a write.
+        // MESSAGE_RECEIVED fires from several branches (script.js:6632/6657/
+        // 6679/6722 + 'first_message'); any that lands with a user message last
+        // used to silently destroy the turn's note AND extraction. Re-arm both.
+        const salvage = note?.extraction ?? skip?.extraction ?? null;
+        if (note) {
+            setPending(note.note, {
+                noteHash: note.noteHash,
+                position: note.position,
+                injected: note.injected,
+                extraction: note.extraction,
+                composer: note.composer,
+                goalIds: note.goalIds,
+                requestIds: note.requestIds,
+            });
+        }
+        if (skip || salvage) {
+            setPendingSkip(SKIP.SLOT_MISMATCH, 'the arriving message was not an assistant reply', token, salvage);
+        }
+        return { bound: false, messageIndex: list.length - 1, swipeIndex: -1, reason: SKIP.SLOT_MISMATCH, reArmed: true };
     }
     const messageIndex = list.length - 1;
     const message = list[messageIndex];
-    if (!message || message.is_user) {
-        return { bound: false, messageIndex, swipeIndex: -1, reason: SKIP.SLOT_MISMATCH };
-    }
     // ST sets swipe_id before generating, so this is the slot being written.
     const swipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
 
@@ -276,11 +292,13 @@ export function bindToMessage(token) {
         return { bound: true, messageIndex, swipeIndex, reason: null, skipped: true };
     }
 
-    // All three pipeline outputs land on this swipe: the extraction (even when
-    // empty — I1: a failed extraction is still stored), the composer record and
-    // the injection record.
+    // All three pipeline outputs land on this swipe: the extraction (absent
+    // when the turn reused a note without one — R2-19: a fabricated empty
+    // extraction is a provenance lie), the composer record and the injection
+    // record. `injected` reflects the ACTUAL splice (R2-9: position 'none'
+    // means log-only and must not claim script-verified injection).
     writeSwipeRecord(message, swipeIndex, {
-        extraction: note.extraction ?? { text: '', model: '', tokensIn: 0, tokensOut: 0 },
+        ...(note.extraction ? { extraction: note.extraction } : {}),
         composer: note.composer
             ? { ...note.composer, text: note.composer.text || note.note }
             : {
@@ -293,7 +311,7 @@ export function bindToMessage(token) {
                 edited: false,
             },
         injection: {
-            injected: true,
+            injected: note.injected !== false,
             position: note.position,
             finalPromptRef: { messageIndex, swipeIndex, at: Date.now() },
             goalsActive: note.goalIds,
@@ -324,8 +342,12 @@ export function recordSkip(log, reason, detail = '', token = currentToken, extra
     const message = list[messageIndex];
     if (message && !message.is_user) {
         const swipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+        // T-R2-11: fold the pending note's extraction exactly like the
+        // forward-reference path — the two paths used to disagree and the
+        // immediate one dropped it silently.
+        const ext = extraction ?? taken?.extraction ?? null;
         writeSwipeRecord(message, swipeIndex, {
-            ...(extraction ? { extraction } : {}),
+            ...(ext ? { extraction: ext } : {}),
             injection: {
                 injected: false,
                 position: 'none',

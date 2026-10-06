@@ -534,6 +534,15 @@ function compressorCall(messages) {
  * remembered for undo.
  */
 async function runManualCompression(indices) {
+    // T-R2-5 (I2): overlapping compressions double-merge the same originals —
+    // `compressedInto` goes last-wins while BOTH merged records claim the same
+    // sources, and undo of one re-exposes facts still merged into the other.
+    // One at a time; overlaps are refused with a line.
+    if (compressionBusy) {
+        log.warn('compress', 'a compression is already running — refusing to overlap (double-merge would corrupt undo)');
+        return { ok: false, reason: 'a compression is already running' };
+    }
+    compressionBusy = true;
     try {
         const list = chat();
         const entries = collectExtractions(list);
@@ -564,6 +573,8 @@ async function runManualCompression(indices) {
     } catch (err) {
         log.error('compress', `compression threw: ${redact(String(err?.message ?? err))}`);
         return { ok: false, reason: String((err && err.message) || err) };
+    } finally {
+        compressionBusy = false;
     }
 }
 
@@ -750,6 +761,12 @@ function injectIntoString(prompt, note, opts) {
 let lastNote = null;
 /** The user's swipe/reroll choice for the generation in flight (phase 3). */
 let rerollChoice = null;
+/** R2-1: what kind of generation is in flight — only 'real' may compose/inject. */
+let generationKind = 'none';
+/** T-R2-4: exactly what was delivered this turn — the watcher verifies THIS. */
+let deliveredNote = null;
+/** T-R2-5: one compression at a time. */
+let compressionBusy = false;
 
 /**
  * The swipe/reroll popup (§6: "On swipe/reroll, a popup asks: new composer note
@@ -770,6 +787,14 @@ function popupWithTimeout(promise, ms, fallback, label) {
     const timeout = new Promise((resolve) => {
         timer = setTimeout(() => {
             log.warn('popup', `${label} unanswered for ${ms}ms — using the benign default '${fallback}' (trap 7)`);
+            // T-R2-13: the timed-out modal must stop blocking the UI — dismiss
+            // the visible popup (its late answer is discarded; the mappers are
+            // pure, verified by inspection).
+            try {
+                const open = [...document.querySelectorAll('.popup')].filter((p) => p.getClientRects().length > 0);
+                const top = open[open.length - 1];
+                top?.querySelector('.popup-button-cancel, .popup-close, .popup-button')?.click();
+            } catch { /* best effort */ }
             resolve(fallback);
         }, ms);
     });
@@ -783,8 +808,8 @@ async function askRerollChoice() {
     try {
         const PopupCls = ctx().Popup;
         if (!PopupCls?.show?.confirm) {
-            log.warn('reroll', 'no Popup in the ST context — defaulting to a new note');
-            return 'new';
+            log.warn('reroll', 'no Popup in the ST context — defaulting to the benign answer (reuse)');
+            return 'reuse';
         }
         // Benign default on timeout = 'reuse' (no model call — decision record 4).
         return await popupWithTimeout(
@@ -796,8 +821,10 @@ async function askRerollChoice() {
             45000, 'reuse', 'reroll popup',
         );
     } catch (err) {
-        log.warn('reroll', `popup failed — defaulting to a new note: ${redact(String(err?.message ?? err))}`);
-        return 'new';
+        // T-R2-13: the benign default is 'reuse' (decision record 4) — the error
+        // path used to default to 'new', the ONE answer that spends money.
+        log.warn('reroll', `popup failed — defaulting to the benign answer (reuse): ${redact(String(err?.message ?? err))}`);
+        return 'reuse';
     }
 }
 
@@ -811,8 +838,8 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
         const call = ctx().callGenericPopup;
         const POPUP_TYPE = ctx().POPUP_TYPE;
         if (!call || !POPUP_TYPE) {
-            log.warn('reroll', 'no popup API in the ST context — defaulting to the new note');
-            return 'new';
+            log.warn('reroll', 'no popup API in the ST context — defaulting to the benign answer (keep the old note)');
+            return 'old';
         }
         const block = (label, text) => `<div class="copilot-diff-block"><strong>${escapeHtml(label)}</strong><pre>${escapeHtml(String(text ?? '(none)'))}</pre></div>`;
         const html = `<div class="copilot-diff">
@@ -822,8 +849,8 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
             ${block('OLD note', oldNote)}
             ${block('NEW note', newNote)}
         </div>`;
-        // Benign default on timeout = 'new' (use what was composed; matches the
-        // catch default). Never hangs the generation (trap 7).
+        // Benign default on timeout = 'old' (keep what was; the no-change
+        // answer — T-R2-13: it used to default to 'new', the money answer).
         return await popupWithTimeout(
             call(html, POPUP_TYPE.CONFIRM, null, {
                 okButton: 'Use the NEW note',
@@ -844,15 +871,23 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
                 }
                 return 'old';
             }),
-            60000, 'new', 'diff popup',
+            60000, 'old', 'diff popup',
         );
     } catch (err) {
-        log.warn('reroll', `diff popup failed — defaulting to the new note: ${redact(String(err?.message ?? err))}`);
-        return 'new';
+        log.warn('reroll', `diff popup failed — defaulting to the benign answer (keep the old note): ${redact(String(err?.message ?? err))}`);
+        return 'old';
     }
 }
 
 async function onGenerationStarted(type, opts = {}, dryRun = false) {
+    // R2-1 (BLOCKER): record the KIND of this generation first — the prompt
+    // hooks fire for quiet prompts (script.js:5183) and raw calls (script.js:
+    // 3970, no GENERATION_STARTED at all) with dryRun:false, and only REAL
+    // narrator turns may compose or inject (GOAL §0.2 rule 5).
+    generationKind = dryRun ? 'dry'
+        : (type === GENERATION_TYPE.QUIET || opts?.quiet_prompt) ? 'quiet'
+            : (type === GENERATION_TYPE.IMPERSONATE) ? 'impersonate'
+                : 'real';
     // Trap 14: every decline logs exactly one line. A dry run, a quiet
     // generation and an impersonation are NOT turns of the narrator and must
     // not consume or advance the generation token — a token bump here once made
@@ -947,6 +982,15 @@ async function onPromptReady(eventData, kind) {
     const payload = eventData ?? {};
     if (payload.dryRun) {
         log.info('inject', 'dry run prompt — nothing injected');
+        return;
+    }
+    // R2-1 (BLOCKER, GOAL §0.2 rule 5): ST fires these hooks with dryRun:false
+    // for QUIET prompts (script.js:5183-5185) and for generateRawData calls
+    // (script.js:3970-3980, which emit NO GENERATION_STARTED at all). Only a
+    // REAL narrator turn may compose a note or touch the prompt — quiet
+    // summaries and raw extension calls must pass through untouched.
+    if (generationKind !== 'real') {
+        log.info('inject', `not a narrator turn (${generationKind}) — nothing composed or injected (rule 5)`);
         return;
     }
     const isArray = Array.isArray(payload.chat);
@@ -1141,20 +1185,32 @@ async function injectIntoUnsafe(payload, shape) {
     }
 
     const opts = s.injection;
+    // R2-9 / T-R2-3: `injected` must reflect the ACTUAL splice, and delivery on
+    // chat-completion sources happens through the REGISTRY (registerNote) — the
+    // string hook fires first with an empty prompt buffer that openai.js never
+    // sends (verified in tests/runs/S1-*: "string at end" → duplicate hook
+    // ignored → FOUND). 'none' means log-only: compose, store, deliver nothing.
+    const actuallyInjected = opts.position !== 'none';
     if (shape === 'array') {
         const count = injectIntoArray(payload.chat, note, opts);
         turn.injection = `array +${count} at ${opts.position}`;
     } else {
         payload.prompt = injectIntoString(payload.prompt, note, opts);
-        turn.injection = `string at ${opts.position}`;
+        turn.injection = actuallyInjected ? `string at ${opts.position}` : 'log only (position: none)';
     }
     turn.incomingPromptSeen = true;
     injectedTokens.add(token);
+
+    // One writer for "what was sent" (T-R2-4): the watcher verifies THIS note,
+    // not a stale module variable — 'use old' and reuse-after-reload used to
+    // verify the wrong text and report "NOT FOUND" for a note that shipped.
+    deliveredNote = note;
 
     // Keep the note for the registry route and for binding after the reply lands.
     setPending(note, {
         noteHash: noteHash(note),
         position: opts.position,
+        injected: actuallyInjected,
         extraction: extractionRecord,
         composer: composerRecord,
         goalIds: activeGoalIds,
@@ -1166,12 +1222,16 @@ async function injectIntoUnsafe(payload, shape) {
     });
 
     // Also register it, so a pre-assembly path and SillyTavern's own machinery
-    // stay consistent if this turn is ever re-assembled.
-    if (lastNote) {
+    // stay consistent if this turn is ever re-assembled. Gated on actuallyInjected
+    // AND on `note` (NOT `lastNote` — T-R2-4: after a reload lastNote is null and
+    // the reused note was never delivered at all while claiming injected:true).
+    if (actuallyInjected && note) {
         registerNote(note, { position: 'in_chat', depth: opts.depth, role: roleCode(opts.role) });
     }
 
-    log.info('inject', `note injected (${turn.injection}), ${note.length} chars, token ${token}`);
+    log.info('inject', actuallyInjected
+        ? `note injected (${turn.injection}), ${note.length} chars, token ${token}`
+        : `note composed and stored but NOT injected — position 'none' is log-only (token ${token})`);
 }
 
 function roleCode(role) {
@@ -1251,6 +1311,7 @@ function onMessageReceived() {
         log.warn('store', `note could not be bound: ${result.reason}`);
     }
     injectedTokens.delete(token);
+    generationKind = 'none'; // R2-1: the turn is over — raw/quiet calls after it decline
     // Reviewer-3: auto-compress is AUTOMATIC when the setting is on (G2 gates
     // the DEFAULT, not the wiring). Fire-and-forget — a slow merge must never
     // block the turn (I5).
@@ -1285,6 +1346,8 @@ function maybeAutoCompress() {
 function onChatChanged() {
     // Trap 7: everything in flight is abandoned on a chat change.
     chatSeq += 1; // F12: turn ids never collide across chats
+    generationKind = 'none'; // R2-1
+    rerollChoice = null; // R2-18: a cross-chat 'reuse' must never fire silently
     const droppedOnSwitch = clearPending(SKIP.CHAT_CHANGED);
     resetTokens();
     injectedTokens.clear();
@@ -1316,16 +1379,29 @@ function installWatcher() {
     watcherInstalled = true;
     window.fetch = async function copilotWatchedFetch(input, init) {
         let watched = false;
+        let watchChatSeq = -1;
         try {
             const url = typeof input === 'string' ? input : (input?.url ?? '');
             const isBackend = /\/api\/backends\/(chat-completions|text-completions)\/generate/.test(url);
-            if (isBackend && typeof init?.body === 'string') {
+            // F16 (critique round 1): only OUR turns are watched. Quiet
+            // generations and other extensions call the same endpoint — they
+            // must not be logged as "note NOT FOUND" nor counted as narrator
+            // spend. `turnInFlight` spans exactly GENERATION_STARTED → reply.
+            if (isBackend && typeof init?.body === 'string' && turnInFlight) {
                 watched = true;
+                watchChatSeq = chatSeq;
                 const turn = log.turn(turnKey(currentTokenSafe()));
                 turn.outgoingPromptSeen = true;
                 turn.outgoingBody = init.body;
-                const check = verifyInOutgoing(init.body, lastNote ?? '');
-                turn.noteFoundOutgoing = check.found;
+                // T-R2-4: verify exactly what THIS turn delivered (deliveredNote) —
+                // verifying a stale module variable reported "NOT FOUND" for notes
+                // that shipped ('use old', reuse-after-reload).
+                const check = verifyInOutgoing(init.body, deliveredNote ?? '');
+                // R2-12: never flip an already-set flag — an unrelated request must
+                // not overwrite a verified result.
+                if (turn.noteFoundOutgoing === undefined || turn.noteFoundOutgoing === null || turn.noteFoundOutgoing === false) {
+                    turn.noteFoundOutgoing = check.found;
+                }
                 turn.finishedAt = Date.now();
                 log[check.found ? 'info' : 'warn'](
                     'outgoing',
@@ -1342,6 +1418,13 @@ function installWatcher() {
             // counted as zero and SAID so, never estimated.
             try {
                 res.clone().json().then((body) => {
+                    // F16: attribute to the chat that was live at REQUEST time —
+                    // a chat switch mid-flight must not leak usage into the
+                    // wrong chat's spend (drop it WITH a line instead).
+                    if (chatSeq !== watchChatSeq) {
+                        log.warn('spend', 'narrator usage arrived after a chat switch — dropped (belongs to another chat)');
+                        return;
+                    }
                     const u = body?.usage;
                     recordRoleSpend('narrator', {
                         tokensIn: u?.prompt_tokens ?? 0,

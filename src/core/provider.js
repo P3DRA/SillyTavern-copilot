@@ -160,15 +160,20 @@ export async function attempt(args) {
     onEvent({ kind: 'request', model, maxTokens, messages, bodyPreview: redact(JSON.stringify(body)) });
 
     // Trap 7 / F4 (critique round 1): a hung fetch must never hang the
-    // generation — every call gets a hard per-call timeout, composed with any
-    // caller-provided signal. Before this, NO call was bounded at all.
+    // generation. Implemented with a plain ref'd setTimeout + AbortController —
+    // portable everywhere (where AbortSignal.timeout/any are missing there used
+    // to be NO timeout at all, and Node's AbortSignal.timeout timer is unref'd,
+    // which silently skipped the timeout in tests).
     const timeoutMs = args.timeoutMs ?? 120000;
-    const timeoutSignal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
-        ? AbortSignal.timeout(timeoutMs)
-        : undefined;
-    let effectiveSignal = signal ?? timeoutSignal;
-    if (signal && timeoutSignal && typeof AbortSignal.any === 'function') {
-        effectiveSignal = AbortSignal.any([signal, timeoutSignal]);
+    const timeoutController = new AbortController();
+    const timeoutTimer = setTimeout(() => timeoutController.abort(), timeoutMs);
+    let effectiveSignal = timeoutController.signal;
+    if (signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+        try {
+            effectiveSignal = AbortSignal.any([signal, timeoutController.signal]);
+        } catch {
+            effectiveSignal = timeoutController.signal;
+        }
     }
 
     let res;
@@ -185,14 +190,16 @@ export async function attempt(args) {
             signal: effectiveSignal,
         });
     } catch (err) {
-        if (timeoutSignal?.aborted) {
+        clearTimeout(timeoutTimer);
+        if (timeoutController.signal.aborted) {
             return finish({ reason: FAIL.NETWORK, detail: `timed out after ${timeoutMs}ms (trap 7)` });
         }
-        if (effectiveSignal?.aborted) {
+        if (effectiveSignal?.aborted || signal?.aborted) {
             return finish({ reason: FAIL.ABORTED, detail: 'the request was aborted' });
         }
         return finish({ reason: FAIL.NETWORK, detail: redact(String(err?.message ?? err)) });
     }
+    clearTimeout(timeoutTimer);
 
     record.status = res.status;
     if (!res.ok) {

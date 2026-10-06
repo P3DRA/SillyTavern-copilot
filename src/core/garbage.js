@@ -150,20 +150,18 @@ function normaliseForMatching(text) {
  */
 export function extractTag(text, tag) {
     const s = String(text ?? '');
-    const open = `<${tag}>`;
-    const close = `</${tag}>`;
-    const openAt = s.indexOf(open);
-    if (openAt === -1) {
-        return { ok: false, reason: REJECT.MISSING_TAG };
+    // Case-insensitive (R2-16): a live model answered <Copilot>…</Copilot> and
+    // was rejected as missing_tag with a lying detail ("no <copilot> tag").
+    const closed = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i').exec(s);
+    if (closed) {
+        return { ok: true, body: String(closed[1] ?? '').trim() };
     }
-    const bodyStart = openAt + open.length;
-    const closeAt = s.indexOf(close, bodyStart);
-    if (closeAt === -1) {
+    if (new RegExp(`<${tag}>`, 'i').test(s)) {
         // Trap 4: a truncated answer. Distinguishable from garbage, and the
         // reason string says so, because the fix is a bigger token budget.
         return { ok: false, reason: REJECT.UNCLOSED_TAG };
     }
-    return { ok: true, body: s.slice(bodyStart, closeAt).trim() };
+    return { ok: false, reason: REJECT.MISSING_TAG };
 }
 
 /**
