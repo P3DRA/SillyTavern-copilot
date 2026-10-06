@@ -265,8 +265,15 @@ async function readPermanentLorebook() {
             return [];
         }
         const wi = await import('/scripts/world-info.js');
+        // BOTH the globally-selected books AND the chat's own book
+        // (chat_metadata.world_info, METADATA_KEY in world-info.js:94) — the
+        // chat book is not in selected_world_info and was silently skipped.
+        const books = [...new Set([
+            ...(wi.selected_world_info ?? []),
+            ...(String(ctx().chatMetadata?.world_info ?? '') ? [String(ctx().chatMetadata.world_info)] : []),
+        ])];
         const out = [];
-        for (const world of (wi.selected_world_info ?? [])) {
+        for (const world of books) {
             const book = await wi.loadWorldInfo(world);
             for (const e of Object.values(book?.entries ?? {})) {
                 if (!e || e.disable || typeof e.content !== 'string') {
