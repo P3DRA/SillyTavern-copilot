@@ -368,8 +368,14 @@ export function tickGoals(goals, now = 'default') {
         g.turnCounters = g.turnCounters || {};
         g.turnCounters[now] = (Number(g.turnCounters[now]) || 0) + 1;
         if (g.remainingTurns !== 'forever') {
-            const used = Object.values(g.turnCounters).reduce((a, b) => a + (Number(b) || 0), 0);
-            if (used >= g.remainingTurns) {
+            // ONE key, one rule (critique finding 19): goalFacts reports the
+            // remaining budget from `turnCounters[now]` — completing on the SUM
+            // of ALL keys diverged as soon as a foreign key existed (imports).
+            const used = Number(g.turnCounters[now]) || 0;
+            // Strictly AFTER the budget (S6's live run caught the off-by-one):
+            // a "2-turn" goal must be visible on turns 1 AND 2, gone at 3. The
+            // old `>=` expired it a turn early.
+            if (used > g.remainingTurns) {
                 g.complete = true;
             }
         }
@@ -423,7 +429,10 @@ export function tickRequests(requests) {
             continue;
         }
         r.turnsElapsed = (Number(r.turnsElapsed) || 0) + 1;
-        if (r.remainingTurns !== 'forever' && r.turnsElapsed >= r.remainingTurns) {
+        if (r.remainingTurns !== 'forever' && r.turnsElapsed > r.remainingTurns) {
+            // Strictly AFTER the budget (S6 live run): a "1-turn" request must
+            // reach the composer on turn 1 and expire at turn 2. The old `>=`
+            // expired it before it was ever seen.
             r.complete = true;
         }
     }
