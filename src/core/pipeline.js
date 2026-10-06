@@ -111,6 +111,10 @@ export async function runPipeline(input, deps = {}) {
             key,
             baseUrl: settings.baseUrl,
             fetchImpl,
+            // T-R2-7: every attempt is bounded by the REMAINING turn budget —
+            // the deadline used to be checked only BETWEEN stages, so a hung
+            // chain could hold ST's awaited hook for many minutes.
+            timeoutMs: Math.max(500, deadlineMs - (Date.now() - started)),
             messages: [
                 { role: 'system', content: extractorPrompt.text },
                 { role: 'user', content: renderMessages(extractWindow.messages) },
@@ -203,6 +207,8 @@ export async function runPipeline(input, deps = {}) {
             key,
             baseUrl: settings.baseUrl,
             fetchImpl,
+            // T-R2-7: same remaining-budget bound as the extractor.
+            timeoutMs: Math.max(500, deadlineMs - (Date.now() - started)),
             messages: [
                 { role: 'system', content: composerPrompt.text },
                 { role: 'user', content: renderMessages(composerWindow.messages) },

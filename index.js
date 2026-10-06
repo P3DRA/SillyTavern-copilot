@@ -533,7 +533,7 @@ function compressorCall(messages) {
  * snapshot goes into chat_metadata (I3, capped at 5) and the merged record is
  * remembered for undo.
  */
-async function runManualCompression(indices) {
+async function runManualCompression(extIds) {
     // T-R2-5 (I2): overlapping compressions double-merge the same originals —
     // `compressedInto` goes last-wins while BOTH merged records claim the same
     // sources, and undo of one re-exposes facts still merged into the other.
@@ -546,6 +546,17 @@ async function runManualCompression(indices) {
     try {
         const list = chat();
         const entries = collectExtractions(list);
+        // T-R2-10 (F18): selections are resolved by EXTRACTION ID against the
+        // fresh list — render-time indices silently selected different entries
+        // after any intervening turn or auto-merge.
+        const indices = [];
+        for (const id of (Array.isArray(extIds) ? extIds : [])) {
+            const i = entries.findIndex((e) => e.extraction.id === id);
+            if (i >= 0 && !indices.includes(i)) {
+                indices.push(i);
+            }
+        }
+        indices.sort((a, b) => a - b);
         const sel = validateSelection(indices);
         if (!sel.ok) {
             log.warn('compress', `refused: ${sel.reason}`);
@@ -623,18 +634,28 @@ async function runAutoCompression() {
     return res;
 }
 
-/** Pin (unmashable) or protect (auto-merge excludes it) one extraction. */
-function toggleEntryFlag(messageIndex, swipeIndex, field) {
+/** Pin (unmashable) or protect (auto-merge excludes it) one extraction BY ID. */
+function toggleEntryFlag(extId, field) {
     try {
-        const message = chat()?.[Number(messageIndex)];
-        const record = readSwipeRecordOrNull(message, Number(swipeIndex));
-        if (!record?.extraction) {
-            return { ok: false, reason: 'no extraction there' };
+        // T-R2-10: rows include MERGED entries (record.extractions[]) — the old
+        // row-index lookup flipped the record's own extraction instead. Resolve
+        // by id across every record.
+        for (const entry of listRecords(chat())) {
+            const rec = entry.record;
+            const candidates = [
+                ...(rec.extraction ? [rec.extraction] : []),
+                ...(Array.isArray(rec.extractions) ? rec.extractions.filter(Boolean) : []),
+            ];
+            for (const ex of candidates) {
+                if (ex.id === extId) {
+                    ex[field] = !ex[field];
+                    writeSwipeRecord(chat()[entry.messageIndex], entry.swipeIndex, {});
+                    log.info('compress', `extraction ${extId}: ${field} = ${ex[field]}`);
+                    return { ok: true, reason: null, value: ex[field] };
+                }
+            }
         }
-        record.extraction[field] = !record.extraction[field];
-        writeSwipeRecord(message, Number(swipeIndex), {});
-        log.info('compress', `extraction ${record.extraction.id}: ${field} = ${record.extraction[field]}`);
-        return { ok: true, reason: null, value: record.extraction[field] };
+        return { ok: false, reason: `no extraction with id ${extId}` };
     } catch (err) {
         log.error('compress', `flag toggle threw: ${redact(String(err?.message ?? err))}`);
         return { ok: false, reason: String((err && err.message) || err) };
@@ -767,6 +788,8 @@ let generationKind = 'none';
 let deliveredNote = null;
 /** T-R2-5: one compression at a time. */
 let compressionBusy = false;
+/** T-R2-2: the record ST deletes on regenerate, folded back into history. */
+let supersededRecord = null;
 
 /**
  * The swipe/reroll popup (§6: "On swipe/reroll, a popup asks: new composer note
@@ -914,6 +937,38 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
         log.warn('inject', `dropped a pending note/extraction (${droppedPending}) — the previous generation never landed a reply`);
     }
     rerollChoice = null;
+    // T-R2-2 (BLOCKER, I1): on a regenerate ST DELETES the old reply
+    // (script.js:4344-4353 — chat.length-- + MESSAGE_DELETED) and the record
+    // lives INSIDE that message: extraction, note and injection all vanish with
+    // the object. GENERATION_STARTED fires BEFORE the deletion, so stash the
+    // record here and fold it into the new message's history when it lands.
+    supersededRecord = null;
+    if (type === 'regenerate') {
+        try {
+            const list = chat();
+            const msg = list[list.length - 1];
+            const rec = (msg && !msg.is_user) ? readSwipeRecordOrNull(msg, Number.isInteger(msg.swipe_id) ? msg.swipe_id : 0) : null;
+            if (rec && (rec.extraction || rec.composer)) {
+                supersededRecord = {
+                    at: Date.now(),
+                    extraction: rec.extraction ? JSON.parse(JSON.stringify(rec.extraction)) : undefined,
+                    composer: rec.composer ? JSON.parse(JSON.stringify(rec.composer)) : undefined,
+                    injection: rec.injection ? JSON.parse(JSON.stringify(rec.injection)) : undefined,
+                };
+                // Persisted so a reload mid-regenerate still folds it back (and
+                // so 'reuse' can find the right note afterwards).
+                const metaRoot = ctx().chatMetadata;
+                if (metaRoot) {
+                    const root = metaRoot.copilot ?? (metaRoot.copilot = {});
+                    root.pendingSupersede = supersededRecord;
+                    saveMetadata();
+                }
+                log.info('store', `regenerate: stashed the outgoing record (${rec.extraction ? 'extraction' : ''}${rec.composer ? '+note' : ''}) — it survives the deleted message`);
+            }
+        } catch (err) {
+            log.warn('store', `could not stash the superseded record: ${redact(String(err?.message ?? err))}`);
+        }
+    }
     const s = settings();
     if (!s.enabled) {
         log.info('generation', `copilot is disabled — ${SKIP.DISABLED}`);
@@ -1060,8 +1115,11 @@ async function injectIntoUnsafe(payload, shape) {
     //
     // F6 (critique round 1): `lastNote` is in-memory — after a reload or chat
     // switch it is null and 'reuse' silently composed a NEW note instead. Fall
-    // back to the STORED note so the user's choice survives.
-    const storedNote = lastNote ?? previousNoteFor(chat());
+    // back to the STORED note so the user's choice survives — and prefer the
+    // SUPERSEDED record (T-R2-2): on a regenerate the note being reused is the
+    // deleted reply's, not the previous message's (trap 6 class).
+    const stash = supersededRecord ?? ctx().chatMetadata?.copilot?.pendingSupersede ?? null;
+    const storedNote = lastNote ?? stash?.composer?.text ?? previousNoteFor(chat());
     const wantsReuse = Boolean(rerollChoice && rerollChoice.token === token
         && rerollChoice.choice === 'reuse' && storedNote);
     if (wantsReuse) {
@@ -1306,6 +1364,27 @@ function onMessageReceived() {
         const what = result.skipped ? 'skip record' : 'note';
         turn.injection = `${turn.injection ?? what} -> bound to message ${result.messageIndex} swipe ${result.swipeIndex}`;
         log.info('store', `${what} bound to message ${result.messageIndex} swipe ${result.swipeIndex}`);
+        // T-R2-2 (I1): fold the record ST deleted on regenerate into the new
+        // message's history — rerolls must never destroy original data.
+        const stashNow = supersededRecord ?? ctx().chatMetadata?.copilot?.pendingSupersede ?? null;
+        if (stashNow) {
+            try {
+                const target = readSwipeRecordOrNull(chat()[result.messageIndex], result.swipeIndex);
+                if (target) {
+                    target.history = [...(Array.isArray(target.history) ? target.history : []), stashNow];
+                    writeSwipeRecord(chat()[result.messageIndex], result.swipeIndex, {});
+                    log.info('store', 'regenerate: the superseded record folded into history (I1 — nothing destroyed)');
+                }
+            } catch (err) {
+                log.warn('store', `could not fold the superseded record: ${redact(String(err?.message ?? err))}`);
+            }
+            supersededRecord = null;
+            const metaRoot = ctx().chatMetadata;
+            if (metaRoot?.copilot) {
+                delete metaRoot.copilot.pendingSupersede;
+                saveMetadata();
+            }
+        }
         saveChatConditional?.();
     } else {
         log.warn('store', `note could not be bound: ${result.reason}`);
@@ -1704,12 +1783,12 @@ function installPanel() {
                     <button type="button" data-act="compress-run">Compress selected</button>
                     <button type="button" data-act="compress-undo">Undo last compression</button>
                 </div>
-                ${entries.map((e, i) => `
-                    <div class="copilot-gr-item" data-cidx="${i}" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
-                        <label><input type="checkbox" data-csel="${i}" /> #${i} (msg ${e.messageIndex})</label>
+                ${entries.map((e) => `
+                    <div class="copilot-gr-item" data-cidx="${e.extraction.id}">
+                        <label><input type="checkbox" data-csel="${e.extraction.id}" /> #${e.messageIndex}.${e.swipeIndex}</label>
                         <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
-                        <button type="button" data-act="toggle-pin">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
-                        <button type="button" data-act="toggle-protect">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
+                        <button type="button" data-act="toggle-pin" data-ext-id="${e.extraction.id}">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
+                        <button type="button" data-act="toggle-protect" data-ext-id="${e.extraction.id}">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
                     </div>`).join('')}
                 <div class="copilot-gr-add">
                     <label><input type="checkbox" data-cset="auto"${s.compress?.auto ? ' checked' : ''} /> auto-compress (default OFF — G2 gate)</label>
@@ -1730,10 +1809,10 @@ function installPanel() {
         const item = btn.closest('.copilot-gr-item');
         const act = btn.dataset.act;
         if (act === 'compress-run') {
-            const indices = [...compressEl.querySelectorAll('[data-csel]')]
+            const ids = [...compressEl.querySelectorAll('[data-csel]')]
                 .filter((c) => c.checked)
-                .map((c) => Number(c.dataset.csel));
-            await runManualCompression(indices);
+                .map((c) => String(c.dataset.csel));
+            await runManualCompression(ids);
         } else if (act === 'compress-undo') {
             undoLastCompression();
         } else if (act === 'compress-auto') {
@@ -1743,8 +1822,8 @@ function installPanel() {
             const auto = Boolean(compressEl.querySelector('[data-cset="auto"]')?.checked);
             saveSettings({ compress: { auto, maxVisible: val('maxVisible') || 40, mergeCount: val('mergeCount') || 10 } });
             log.info('compress', `settings saved: auto=${auto} maxVisible=${val('maxVisible')} mergeCount=${val('mergeCount')}`);
-        } else if ((act === 'toggle-pin' || act === 'toggle-protect') && item) {
-            toggleEntryFlag(Number(item.dataset.mi), Number(item.dataset.si), act === 'toggle-pin' ? 'pinned' : 'protected');
+        } else if (act === 'toggle-pin' || act === 'toggle-protect') {
+            toggleEntryFlag(String(btn.dataset.extId ?? ''), act === 'toggle-pin' ? 'pinned' : 'protected');
         }
         renderCompress();
         render();
