@@ -2189,6 +2189,14 @@ function installPanel() {
                             <option value="none">none (log only)</option>
                         </select>
                     </label>
+                    <label>injection depth / role
+                        <input type="text" data-set="injectDepth" size="3" title="in_chat depth: how many messages from the end" />
+                        <select data-set="injectRole">
+                            <option value="system">system</option>
+                            <option value="user">user</option>
+                            <option value="assistant">assistant</option>
+                        </select>
+                    </label>
                 </div>
                 <details><summary>prompt templates (namespaced {{copilot.*}} blocks)</summary>
                     <label>extractor <textarea data-set="promptExtractor" rows="5"></textarea></label>
@@ -2215,6 +2223,8 @@ function installPanel() {
                 dp.checked = keep.diffPopup !== undefined ? keep.diffPopup === 'true' : (s.diffPopup !== false);
             }
             put('injectPosition', s.injection?.position ?? 'end');
+            put('injectDepth', s.injection?.depth ?? 0);
+            put('injectRole', s.injection?.role ?? 'system');
             put('promptExtractor', s.extractor?.prompt ?? '');
             put('promptComposer', s.composer?.prompt ?? '');
             put('promptCompressor', s.compressorPrompt ?? '');
@@ -2271,6 +2281,8 @@ function installPanel() {
                 injection: {
                     ...s.injection,
                     position: get('injectPosition') || 'end',
+                    depth: num(get('injectDepth'), 0),
+                    role: get('injectRole') || 'system',
                 },
                 compressorPrompt: get('promptCompressor') || undefined,
             });

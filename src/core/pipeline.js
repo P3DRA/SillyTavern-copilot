@@ -127,7 +127,6 @@ export async function runPipeline(input, deps = {}) {
             // a cheap extractor silently produced nothing.
             minWords: 1,
             maxWords: 20000,
-            allowRefusal: true,
             signal,
             onEvent,
         });
@@ -236,7 +235,6 @@ export async function runPipeline(input, deps = {}) {
             tag: 'copilot',
             minWords: noteBudget.minWords,
             maxWords: noteBudget.maxWords,
-            allowRefusal: true,
             signal,
             onEvent,
         });

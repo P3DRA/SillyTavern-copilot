@@ -317,14 +317,14 @@ export async function attempt(args) {
  * @param {object} args
  * @param {string[]} args.models          Fallback chain, in order.
  * @param {number} [args.retries]         Attempts per model before moving on.
- * @param {boolean} [args.allowRefusal]   Keep a refusal's TEXT in the result for
- *   the record. It never becomes usable output — see below.
+ *   (Refusals always keep their TEXT in the result for the record and always
+ *   route to the next model — there is no mode where they become output.)
  * @param {(event: object) => void} [args.onEvent]
  * @returns {Promise<{ok: boolean, text: string, model: string|null, attempts: object[], deadKey: boolean, summary: string}>}
  */
 export async function callWithFallback(args) {
     const {
-        models, retries = 1, onEvent = () => {}, allowRefusal = false,
+        models, retries = 1, onEvent = () => {},
     } = args;
     const chain = (Array.isArray(models) ? models : []).filter(Boolean);
     /** @type {object[]} */
