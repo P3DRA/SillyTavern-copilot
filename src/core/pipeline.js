@@ -199,7 +199,11 @@ export async function runPipeline(input, deps = {}) {
             maxWords: String(noteBudget.maxWords),
         });
         onEvent({ kind: 'compose-start', messages: composerWindow.messages.length, dropped: composerWindow.dropped });
-        result.inputs.composer = `${composerPrompt.text}\n\n${renderMessages(composerWindow.messages)}`;
+        // R2-32: the transcript is already in the system prompt via
+        // {{copilot.lastMessages}} — the user message used to send it AGAIN
+        // (double cost on every compose). A short nudge keeps providers happy
+        // that dislike system-only conversations without re-sending the text.
+        result.inputs.composer = `${composerPrompt.text}\n\nWrite the guidance note.`;
 
         const composeResult = await callWithFallback({
             models: settings.composer?.chain ?? [],
@@ -211,7 +215,7 @@ export async function runPipeline(input, deps = {}) {
             timeoutMs: Math.max(500, deadlineMs - (Date.now() - started)),
             messages: [
                 { role: 'system', content: composerPrompt.text },
-                { role: 'user', content: renderMessages(composerWindow.messages) },
+                { role: 'user', content: 'Write the guidance note.' },
             ],
             temperature: settings.composer?.temperature ?? 0.7,
             maxTokens: settings.composer?.maxTokens,

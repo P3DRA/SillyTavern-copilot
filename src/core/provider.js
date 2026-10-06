@@ -178,7 +178,7 @@ export async function attempt(args) {
 
     let res;
     try {
-        res = await fetchImpl(`${baseUrl}/chat/completions`, {
+        res = await fetchImpl(`${baseUrl || DEFAULT_BASE_URL}/chat/completions`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',

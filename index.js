@@ -48,7 +48,7 @@ import {
     ctx, chat, eventSource, saveChatConditional, saveMetadata,
     nextToken, isCurrent, resetTokens, clearPending,
     setPending, getPending, bindToMessage, recordSkip, registerNote, clearNote,
-    hasPendingSkip,
+    hasPendingSkip, currentTokenValue,
 } from './src/st/adapter.js';
 
 const log = new DebugLog();
@@ -936,7 +936,7 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
         log.info('generation', 'impersonate — the narrator is not generating');
         return;
     }
-    lastToken = nextToken();
+    lastToken = nextToken(); // kept in sync by construction (R2-20: one counter)
     lorebookEntries = new Map();
     clearNote();
     const droppedPending = clearPending(SKIP.STALE_GENERATION);
@@ -1003,7 +1003,10 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
 }
 
 function currentTokenSafe() {
-    return lastToken;
+    // R2-20 (trap 15 class): ONE source of truth — the adapter's counter. There
+    // used to be a second copy here that was NOT reset on chat change, so the
+    // watcher keyed turns with a stale token.
+    return currentTokenValue();
 }
 
 let lastToken = 0;
@@ -1320,7 +1323,14 @@ async function injectIntoUnsafe(payload, shape) {
     // AND on `note` (NOT `lastNote` — T-R2-4: after a reload lastNote is null and
     // the reused note was never delivered at all while claiming injected:true).
     if (actuallyInjected && note) {
-        registerNote(note, { position: 'in_chat', depth: opts.depth, role: roleCode(opts.role) });
+        // T-R2-3: the REGISTRY is what actually delivers on chat-completion
+        // sources (the string hook's buffer is never sent) — map the configured
+        // position onto it instead of hardcoding in_chat at depth 0.
+        const registryPos = opts.position === 'first' ? 'in_prompt' : 'in_chat';
+        const registryDepth = opts.position === 'before_last'
+            ? 1
+            : (Number.isFinite(Number(opts.depth)) ? Number(opts.depth) : 0);
+        registerNote(note, { position: registryPos, depth: registryDepth, role: roleCode(opts.role) });
     }
 
     log.info('inject', actuallyInjected
@@ -1470,6 +1480,32 @@ function onChatChanged() {
     lastNote = null;
     clearNote();
     log.info('chat', `chat changed — pending state cleared${droppedOnSwitch ? ` (dropped a pending ${droppedOnSwitch})` : ''}`);
+    // F11 / R2-21: migrateChat was DEAD WIRING — records written by other
+    // schema versions were never migrated on load. Run it here, guarded: a
+    // dry run first (it changes nothing), then the real pass only if needed.
+    setTimeout(() => {
+        (async () => {
+            try {
+                const list = chat();
+                if (!Array.isArray(list) || list.length === 0) {
+                    return;
+                }
+                const mig = await import('./src/schema/migrate.js');
+                if (!mig.needsMigration(list)) {
+                    return;
+                }
+                const dry = mig.migrateChat(list, { dryRun: true });
+                log.info('migrate', `chat needs migration: inspected=${dry.inspected} would-change=${dry.changed} unreadable=${dry.unreadable} future=${dry.future}`);
+                if (dry.changed > 0 || dry.unreadable > 0) {
+                    const real = mig.migrateChat(list, {});
+                    log.info('migrate', `chat migrated: changed=${real.changed} unreadable=${real.unreadable}`);
+                    saveChatConditional?.();
+                }
+            } catch (err) {
+                log.warn('migrate', `migration failed: ${redact(String(err?.message ?? err))}`);
+            }
+        })();
+    }, 250);
 }
 
 /* -------------------------------------------------------------- diagnostics */
