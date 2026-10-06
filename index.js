@@ -224,6 +224,10 @@ async function collectInput(turnId) {
         goals: goalFacts(meta.goals ?? [], GOAL_COUNTER_KEY),
         previousNote: previousNoteFor(list),
         settings: settings(),
+        // §5 (critique finding 12): which goals/requests were ACTIVE when this
+        // note was composed — they end up in injection.goalsActive/userRequestsActive.
+        goalIds: (meta.goals ?? []).filter((g) => !g.complete).map((g) => g.id),
+        requestIds: (meta.requests ?? []).filter((r) => !r.complete).map((r) => r.id),
     };
 }
 
@@ -1001,6 +1005,11 @@ async function injectIntoUnsafe(payload, shape) {
             if (!composed.ok) {
                 turn.skipReason = composed.reason;
                 turn.failure = { reason: composed.reason, detail: composed.detail ?? '' };
+                // I1 (F1, critique round 1): the pipeline KEEPS the extraction
+                // even when the composer fails — carry it so recordSkip can
+                // store it. Without this the extractor's output was destroyed.
+                extractionRecord = composed.extraction ?? null;
+                turn.extraction = extractionRecord;
                 log.warn('pipeline', `no note this turn — ${composed.reason}: ${composed.detail ?? ''}`);
                 break;
             }
@@ -1037,7 +1046,7 @@ async function injectIntoUnsafe(payload, shape) {
                 break;
             }
             if (choice === 'cancel') {
-                recordSkip(log, SKIP.SUPPRESSED, 'diff popup: cancel — no note this turn', token);
+                recordSkip(log, SKIP.SUPPRESSED, 'diff popup: cancel — no note this turn', token, extractionRecord);
                 injectedTokens.add(token);
                 return;
             }
@@ -1075,6 +1084,8 @@ async function injectIntoUnsafe(payload, shape) {
         position: opts.position,
         extraction: extractionRecord,
         composer: composerRecord,
+        goalIds: input.goalIds ?? [],
+        requestIds: input.requestIds ?? [],
         model: composerRecord?.model,
         tokensIn: composerRecord?.tokensIn,
         tokensOut: composerRecord?.tokensOut,

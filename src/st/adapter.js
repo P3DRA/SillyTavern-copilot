@@ -150,9 +150,41 @@ export function takePending(token = currentToken) {
 }
 
 export function clearPending(reason) {
-    const had = pending !== null;
+    const had = pending !== null || pendingSkip !== null;
     pending = null;
+    pendingSkip = null;
     return had ? reason : null;
+}
+
+/**
+ * Skips waiting for the message that will hold their reason.
+ *
+ * F1 (critique round 1): a skip on an ORDINARY turn happens while the last
+ * message is still the USER's — there is no reply slot to write to yet. The
+ * skip is forward-referenced exactly like the note and written at
+ * MESSAGE_RECEIVED, so the reason AND the extractor's output survive (I1,
+ * trap 14). Before this, every ordinary-turn failure silently destroyed both.
+ */
+let pendingSkip = null;
+
+export function setPendingSkip(reason, detail = '', token = currentToken, extraction = null) {
+    pendingSkip = {
+        token,
+        reason,
+        detail: detail ?? '',
+        extraction: extraction ?? null,
+        createdAt: Date.now(),
+    };
+    return pendingSkip;
+}
+
+export function takePendingSkip(token = currentToken) {
+    if (!pendingSkip || pendingSkip.token !== token) {
+        return null;
+    }
+    const taken = pendingSkip;
+    pendingSkip = null;
+    return taken;
 }
 
 /* ---------------------------------------------------------------- injection */
@@ -206,7 +238,8 @@ export function clearNote() {
  */
 export function bindToMessage(token) {
     const note = takePending(token);
-    if (!note) {
+    const skip = takePendingSkip(token);
+    if (!note && !skip) {
         return { bound: false, messageIndex: -1, swipeIndex: -1, reason: SKIP.STALE_GENERATION };
     }
     const list = chat();
@@ -220,6 +253,23 @@ export function bindToMessage(token) {
     }
     // ST sets swipe_id before generating, so this is the slot being written.
     const swipeIndex = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+
+    if (!note) {
+        // A failed or suppressed turn (F1): the reply arrives with NO note, but
+        // the reason and the extractor's output belong on it (I1, trap 14).
+        writeSwipeRecord(message, swipeIndex, {
+            ...(skip.extraction ? { extraction: skip.extraction } : {}),
+            injection: {
+                injected: false,
+                position: 'none',
+                finalPromptRef: { messageIndex, swipeIndex, at: Date.now() },
+                goalsActive: [],
+                userRequestsActive: [],
+                skipReason: skip.reason,
+            },
+        });
+        return { bound: true, messageIndex, swipeIndex, reason: null, skipped: true };
+    }
 
     // All three pipeline outputs land on this swipe: the extraction (even when
     // empty — I1: a failed extraction is still stored), the composer record and
@@ -280,8 +330,15 @@ export function recordSkip(log, reason, detail = '', token = currentToken, extra
                 skipReason: reason,
             },
         });
+        log?.warn('inject-skipped', `${reason}${detail ? ` — ${detail}` : ''}`);
+        return reason;
     }
-    log?.warn('inject-skipped', `${reason}${detail ? ` — ${detail}` : ''}`);
+    // F1: on an ORDINARY turn the last message is the USER's — the reply slot
+    // does not exist yet. Forward-reference the skip exactly like the note; it
+    // is written at MESSAGE_RECEIVED (bindToMessage). Before this fix, every
+    // ordinary-turn failure silently destroyed the reason AND the extraction.
+    setPendingSkip(reason, detail, token, extraction ?? taken?.extraction ?? null);
+    log?.warn('inject-skipped', `${reason}${detail ? ` — ${detail}` : ''} (record binds when the reply lands)`);
     return reason;
 }
 

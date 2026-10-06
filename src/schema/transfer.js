@@ -151,13 +151,12 @@ export function importChatState(chat, meta, state) {
  * @param {{snapshot: object, metaSnapshot: object, createdSlots?: Array<{messageIndex: number, swipeIndex: number}>}} saved from importChatState.
  */
 export function restoreImport(chat, meta, saved) {
-    if (!saved || !saved.snapshot) {
-        return { ok: false, reason: 'no pre-import snapshot' };
+    if (!saved || !saved.snapshot || !Array.isArray(saved.snapshot.messages)) {
+        return { ok: false, reason: 'no usable pre-import snapshot' };
     }
-    const restored = restoreChat(chat, saved.snapshot);
-    if (restored && restored.ok === false) {
-        return { ok: false, reason: restored.reason ?? 'restore failed' };
-    }
+    // restoreChat returns the number of touched records — NOT a result object
+    // (its old `.ok` check was dead code, critique round 1 finding 18).
+    restoreChat(chat, saved.snapshot);
     // Remove any swipe_info slots the import had to create — restore means
     // EXACTLY the pre-import structure, scaffolding included.
     for (const slot of (saved.createdSlots ?? [])) {
@@ -167,10 +166,19 @@ export function restoreImport(chat, meta, saved) {
             msg.swipe_info.splice(slot.swipeIndex, 1);
         }
     }
-    // Metadata: remove exactly what the import added — safest is to reset the
-    // tracked lists to the snapshot's copies (I1: nothing else is touched).
+    // Metadata: reset the tracked lists to the snapshot's copies — and DELETE
+    // the keys entirely when the snapshot had none, so "byte-identical" is
+    // literal (finding 18: writing [] where no key existed was not).
     const snap = saved.metaSnapshot ?? {};
-    meta.goals = Array.isArray(snap.goals) ? snap.goals : [];
-    meta.requests = Array.isArray(snap.requests) ? snap.requests : [];
+    if (Array.isArray(snap.goals)) {
+        meta.goals = snap.goals;
+    } else {
+        delete meta.goals;
+    }
+    if (Array.isArray(snap.requests)) {
+        meta.requests = snap.requests;
+    } else {
+        delete meta.requests;
+    }
     return { ok: true, reason: null };
 }

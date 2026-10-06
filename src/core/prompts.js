@@ -157,9 +157,9 @@ editing.
 
 Output ONLY this structure, nothing else:
 
-<merged>
+<compressed>
 your merged text
-</merged>
+</compressed>
 
 STYLE
 - Same language as the input.
@@ -435,8 +435,26 @@ export function detectLanguage(messagesOrText) {
     if (has(/[฀-๿]/)) {
         return { code: 'th', note: 'Thai' };
     }
-    if (has(/[áàâãäéèêëíìîïóòôõöúùûüçñ]/i) && has(/[áàâãäéèêëíìîïóòôõöúùûüçñ]/i)) {
-        return { code: 'pt', note: 'Latin with diacritics (Portuguese/Spanish family)' };
+    // Latin-script heuristics: ã/õ are Portuguese-only, ñ/¿/¡ Spanish-only,
+    // plus word hints for texts without those markers ("Ela entrou na sala em
+    // silêncio"). (The old code tested the SAME regex twice and labelled every
+    // diacritic-language 'pt' — critique round 1, finding 30.)
+    const PT_WORDS = /\b(ela|ele|entrou|não|nao|voce|você|também|tambem|então|entao|até|ate|após|apos|são|sao|estava|estão|estao|será|sera|silêncio|silencio|cozinha|balcão|balcao|coisa|isso|obrigado|obrigada)\b/i;
+    const ES_WORDS = /\b(ella|pero|porque|muy|también|tambien|ahora|entonces|así|asi|aquí|aqui|allí|alli|siempre|está|esta|estás|estas|señor|senor|señora|senora|cómo|como|cuándo|cuando|dónde|donde)\b/i;
+    if (has(/[ãõ]/i) || PT_WORDS.test(sample)) {
+        return { code: 'pt', note: 'Portuguese markers or vocabulary' };
+    }
+    if (has(/[ñ¿¡]/i) || ES_WORDS.test(sample)) {
+        return { code: 'es', note: 'Spanish markers or vocabulary' };
+    }
+    if (has(/[àâçéèêëîïôùûœ]/i)) {
+        return { code: 'fr', note: 'French diacritics' };
+    }
+    if (has(/[äöüß]/i)) {
+        return { code: 'de', note: 'German diacritics' };
+    }
+    if (has(/[áéíóúü]/i)) {
+        return { code: 'es', note: 'Latin with acute accents (Spanish family)' };
     }
     return { code: 'en', note: 'default: assumed English' };
 }
