@@ -39,6 +39,7 @@ import {
 import {
     compressEntries, undoCompressionAt, autoSelect, validateSelection,
 } from './src/core/compressor.js';
+import { exportChatState, importChatState, restoreImport } from './src/schema/transfer.js';
 import { callWithFallback } from './src/core/provider.js';
 import { pushSnapshot } from './src/schema/records.js';
 import { redact } from './src/core/redact.js';
@@ -549,6 +550,64 @@ function toggleEntryFlag(messageIndex, swipeIndex, field) {
         return { ok: true, reason: null, value: record.extraction[field] };
     } catch (err) {
         log.error('compress', `flag toggle threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
+}
+
+/* ------------------------------------------------------- import / export */
+
+/** Bundle this chat's copilot state (extractions, goals, requests). */
+function exportStateToBundle() {
+    const meta = ctx().chatMetadata?.copilot ?? {};
+    const bundle = exportChatState(chat(), meta);
+    log.info('transfer', `exported ${bundle.extractions.length} extractions, ${bundle.goals.length} goals, ${bundle.requests.length} requests`);
+    return bundle;
+}
+
+/**
+ * Import a bundle into this chat (S9). The pre-import snapshot is kept in
+ * chat_metadata so "Restore pre-import snapshot" is always one click away.
+ */
+function importStateFromBundle(state) {
+    try {
+        const metaRoot = ctx().chatMetadata;
+        if (!metaRoot) {
+            return { ok: false, reason: 'no chat metadata' };
+        }
+        const meta = metaRoot.copilot ?? (metaRoot.copilot = {});
+        const res = importChatState(chat(), meta, state);
+        if (!res.ok) {
+            log.warn('transfer', `import refused: ${res.reason}`);
+            return { ok: false, reason: res.reason };
+        }
+        meta.preImportSnapshot = { snapshot: res.snapshot, metaSnapshot: res.metaSnapshot, createdSlots: res.createdSlots };
+        saveMetadata();
+        saveChatConditional?.();
+        log.info('transfer', `imported ${res.added} extractions, ${meta.goals?.length ?? 0} goals, ${meta.requests?.length ?? 0} requests (snapshot kept for undo)`);
+        return { ok: true, reason: null, added: res.added };
+    } catch (err) {
+        log.error('transfer', `import threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
+}
+
+/** Restore the pre-import snapshot exactly (S9). */
+function restorePreImport() {
+    try {
+        const metaRoot = ctx().chatMetadata;
+        const meta = metaRoot?.copilot ?? {};
+        const res = restoreImport(chat(), meta, meta.preImportSnapshot);
+        if (!res.ok) {
+            log.warn('transfer', `restore refused: ${res.reason}`);
+            return { ok: false, reason: res.reason };
+        }
+        delete meta.preImportSnapshot;
+        saveMetadata();
+        saveChatConditional?.();
+        log.info('transfer', 'pre-import snapshot restored (S9)');
+        return { ok: true, reason: null };
+    } catch (err) {
+        log.error('transfer', `restore threw: ${redact(String(err?.message ?? err))}`);
         return { ok: false, reason: String((err && err.message) || err) };
     }
 }
@@ -1161,6 +1220,7 @@ function installPanel() {
                 <div class="copilot-presets"></div>
                 <div class="copilot-spend"></div>
                 <div class="copilot-compress"></div>
+                <div class="copilot-transfer"></div>
                 <div class="copilot-records"></div>
             </div>
         </div>`;
@@ -1405,6 +1465,68 @@ function installPanel() {
         render();
     });
 
+    // ---- Import / export (phase 7, §6 / S9): carry memory between chats.
+    // Every import keeps a pre-import snapshot; restore is one click.
+    const transferEl = panel.querySelector('.copilot-transfer');
+    const renderTransfer = () => {
+        try {
+            // Keep whatever the user has in the box across re-renders — the
+            // export flow writes into it and then re-renders.
+            const keep = transferEl.querySelector('[data-gr="transfer-json"]')?.value ?? '';
+            transferEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>import / export</strong>
+                    <em class="copilot-spend-note">carry memory between chats (S9) — a snapshot is kept before every import</em>
+                </div>
+                <div class="copilot-gr-add">
+                    <button type="button" data-act="export-state">Export chat state</button>
+                    <button type="button" data-act="import-state">Import into this chat</button>
+                    <button type="button" data-act="restore-import">Restore pre-import snapshot</button>
+                </div>
+                <textarea data-gr="transfer-json" rows="4" placeholder="exported bundle JSON appears here; paste a bundle here to import it"></textarea>`;
+            const ta = transferEl.querySelector('[data-gr="transfer-json"]');
+            if (ta && keep) {
+                ta.value = keep;
+            }
+        } catch (err) {
+            transferEl.textContent = `transfer unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    transferEl.addEventListener('click', async (ev) => {
+        const btn = ev.target.closest?.('button[data-act]');
+        if (!btn) {
+            return;
+        }
+        const ta = transferEl.querySelector('[data-gr="transfer-json"]');
+        if (btn.dataset.act === 'export-state') {
+            const bundle = exportStateToBundle();
+            // The log line inside export re-renders this section (subscriber!),
+            // detaching the textarea — so render FIRST, then write into the
+            // FRESH node.
+            renderTransfer();
+            const fresh = transferEl.querySelector('[data-gr="transfer-json"]');
+            if (fresh) {
+                fresh.value = JSON.stringify(bundle);
+            }
+            render();
+            return;
+        }
+        if (btn.dataset.act === 'import-state') {
+            let state = null;
+            try {
+                state = JSON.parse(ta ? ta.value : '');
+            } catch {
+                log.warn('transfer', 'import refused: the box does not contain valid JSON');
+            }
+            if (state) {
+                importStateFromBundle(state);
+            }
+        } else if (btn.dataset.act === 'restore-import') {
+            restorePreImport();
+        }
+        renderTransfer();
+        render();
+    });
+
     // ---- The log browser (phase 3, §6): every record in the chat, one card
     // layout repeated per message/swipe, each entry editable. Editing keeps the
     // old value (I1) and an extraction edit flags its composer entry stale.
@@ -1488,12 +1610,13 @@ function installPanel() {
         // Refresh the browser/goals/spend unless the user is typing in them.
         if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
             && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)
-            && !compressEl.contains(document.activeElement)) {
+            && !compressEl.contains(document.activeElement) && !transferEl.contains(document.activeElement)) {
             renderRecords();
             renderGoals();
             renderPresets();
             renderSpend();
             renderCompress();
+            renderTransfer();
         }
     });
     render();
@@ -1502,6 +1625,7 @@ function installPanel() {
     renderPresets();
     renderSpend();
     renderCompress();
+    renderTransfer();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 
@@ -1538,6 +1662,8 @@ function init() {
         spendTotals, savePreset, applyPresetById, deletePreset,
         compress: runManualCompression, undoCompression: undoLastCompression,
         autoCompress: runAutoCompression, toggleEntryFlag,
+        exportState: exportStateToBundle, importState: importStateFromBundle,
+        restoreImport: restorePreImport,
     };
 
     log.info('boot', `copilot wired up — build ${BUILD_ID}`);

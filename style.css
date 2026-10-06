@@ -162,6 +162,28 @@
     border-radius: 3px;
 }
 
+/* ---- Import / export (phase 7) ---- */
+.copilot-transfer textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 11px;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+}
+
+.copilot-transfer button {
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 3px;
+}
+
 /* ---- Goals and user requests (phase 4) ---- */
 .copilot-goals {
     border-top: 1px solid var(--SmartThemeBorderColor, #444);
