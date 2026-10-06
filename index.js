@@ -223,7 +223,7 @@ function apiKeyProblem() {
 function saveSettings(patch) {
     const root = ctx().extensionSettings;
     if (!root) {
-        return;
+        return false;
     }
     root[SETTINGS_KEY] = { ...(root[SETTINGS_KEY] ?? {}), ...patch };
     // ST persists extension_settings inside its main settings payload
@@ -233,6 +233,15 @@ function saveSettings(patch) {
     // exposes saveSettingsDebounced (st-context.js:131); ST's own extensions
     // (extensions.js:673) persist extension settings the same way.
     ctx().saveSettingsDebounced?.();
+    // T-R4-2 (user report: "key really doesn't want to be kept"): the debounced
+    // save is throttled (script.js:469, DEFAULT_SAVE_EDIT_TIMEOUT) — a reload
+    // or tab close within that window silently LOSES the write. script.js also
+    // exports the immediate `saveSettings` (script.js:7992); call it too so the
+    // write hits the server now. Both paths send the same merged payload.
+    import('/script.js')
+        .then((m) => { try { m.saveSettings?.(); } catch { /* debounced path still runs */ } })
+        .catch(() => { /* older host: the debounced call above is the fallback */ });
+    return true;
 }
 
 /* ------------------------------------------------------------------- inputs */
@@ -1834,6 +1843,7 @@ function installPanel() {
     // actionable. Never throws: the lamp is decoration and must not break the
     // panel (I5).
     const pilotEl = panel.querySelector('.copilot-pilot');
+    const toggleBtn = panel.querySelector('[data-act="toggle"]');
     const renderPilot = () => {
         try {
             const s = settings();
@@ -1841,8 +1851,15 @@ function installPanel() {
             const on = Boolean(s.enabled) && hasKey;
             pilotEl.classList.toggle('copilot-pilot-on', on);
             pilotEl.classList.toggle('copilot-pilot-off', !on);
+            // T-R4-2 (user report: "pilot light not working"): the button said
+            // just "Toggle", so a user who had flipped it OFF could not tell
+            // which state they were in or which way it would go. The label is
+            // now the ACTION, and the lamp itself is clickable.
+            if (toggleBtn) {
+                toggleBtn.textContent = s.enabled ? 'Disable copilot' : 'Enable copilot';
+            }
             const why = !s.enabled
-                ? 'copilot is DISABLED — press Toggle above to enable it'
+                ? "copilot is DISABLED — click this lamp or press 'Enable copilot' above"
                 : (!hasKey
                     ? (apiKeyProblem() || 'no API key')
                     : `active — key from ${apiKeySource() === 'panel' ? 'the panel field' : 'ST\'s server secret'}, extractor + composer will run on the next narrator turn`);
@@ -1852,6 +1869,17 @@ function installPanel() {
             // Decoration only — a failure here must never take the panel down.
         }
     };
+    // The lamp is a real switch. stopPropagation matters: it sits INSIDE ST's
+    // global `.inline-drawer-toggle` header handler (script.js:12131), which
+    // would otherwise collapse the drawer on every lamp click.
+    pilotEl.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const s = settings();
+        saveSettings({ enabled: !s.enabled });
+        log.info('panel', `copilot ${!s.enabled ? 'enabled' : 'disabled'} (pilot light clicked)`);
+        renderPilot();
+        render();
+    });
 
     // ---- Goals and user requests (phase 4, §6 / S6). The counters shown here
     // are the SCRIPT-tracked facts the composer receives — the model is never
@@ -2381,6 +2409,17 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                 </details>
                 <div class="copilot-gr-add"><button type="button" data-act="settings-save">Save settings</button></div>`;
             put('apiKey', '');
+            // T-R4-2 (user report: "key really doesn't want to be kept"): the
+            // field renders EMPTY even when a key IS saved — secrets are never
+            // echoed into the DOM — and that looked exactly like "the key did
+            // not save". The placeholder now reports the SAVED state.
+            const keyEl = settingsEl.querySelector('[data-set="apiKey"]');
+            if (keyEl) {
+                const hasStoredKey = Boolean(String(settings().apiKey ?? '').trim()) || Boolean(stSecretKey);
+                keyEl.placeholder = hasStoredKey
+                    ? 'a saved key is on file — type here to replace it'
+                    : 'type the key here (most reliable)';
+            }
             put('baseUrl', s.baseUrl ?? '');
             put('extractorChain', (s.extractor?.chain ?? []).join(', '));
             put('composerChain', (s.composer?.chain ?? []).join(', '));
@@ -2506,6 +2545,11 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
             });
             log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models)`);
             renderPilot();
+            // T-R4-2: re-render EXPLICITLY. The log subscriber skips it while a
+            // settings control has focus — which is exactly the state after a
+            // Save click — so the "saved key is on file" placeholder would stay
+            // stale and the box would keep looking unsaved.
+            renderSettings();
         } catch (err) {
             log.warn('settings', `save failed: ${redact(String(err?.message ?? err))}`);
         }
@@ -2705,6 +2749,11 @@ function init() {
     // pilot light, which otherwise could stay on its boot-time state until the
     // next turn.
     refreshSecretKey().then(() => {
+        // T-R4-2: say the disabled state LOUDLY at boot — the extension being
+        // off is the one state where the key is never used at all.
+        if (settings().enabled === false) {
+            log.warn('boot', "copilot is DISABLED in its settings — nothing will run and no key will be used. Click the pilot lamp or press 'Enable copilot' in the panel.");
+        }
         const src = apiKeySource();
         log.info('boot', src
             ? `API key resolved from ${src === 'panel' ? 'the panel field' : "ST's OpenRouter secret"}`
