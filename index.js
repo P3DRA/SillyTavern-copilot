@@ -1373,34 +1373,24 @@ async function injectIntoUnsafe(payload, shape) {
     if (wantsReuse) {
         note = storedNote;
         turn.reroll = 'reused the previous note (user choice)';
-        // M4 (§4): "A swipe means a new extractor run" — only the NOTE is
-        // reused; the extraction is recomputed against the CURRENT turn. Before
-        // this, reuse ran NOTHING and served the pre-edit note to boot.
-        try {
-            const ex = await runPipeline(input, {
-                key: apiKey(),
-                deadlineMs: budgetLeft(),
-                extractOnly: true,
-                onEvent: (e) => log.info('pipeline', `reuse-turn extractor: ${e.kind}`),
-            });
-            if (ex.spend?.extractor) {
-                recordRoleSpend('extractor', ex.spend.extractor);
-            }
-            extractionRecord = ex.extraction ?? null;
-            turn.extraction = extractionRecord;
-            if (!ex.ok) {
-                log.warn('pipeline', `reuse turn: extractor failed (${ex.reason}) — the note is reused without a fresh extraction`);
-            }
-        } catch (err) {
-            log.warn('pipeline', `reuse turn: extractor threw: ${redact(String(err?.message ?? err))}`);
-        }
+        // T-R5-15 (user: "Extractor was called even though i asked to reuse the
+        // last output"): reuse means reuse EVERYTHING — no model calls at all.
+        // The old M4 behaviour re-ran the extractor on every swipe, which cost
+        // money and rate budget for a near-identical extraction and is exactly
+        // what the user did not ask for. Deviation from GOAL §4's "a swipe means
+        // a new extractor run" is deliberate and recorded in PROGRESS.md.
+        const prevExtraction = stash?.extraction ?? null;
+        extractionRecord = prevExtraction
+            ? { ...JSON.parse(JSON.stringify(prevExtraction)), model: '(reused from the previous turn)', reused: true }
+            : null;
+        turn.extraction = extractionRecord;
         composerRecord = {
             text: note, model: '(reused from the previous turn)',
             tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
         };
         turn.composer = composerRecord;
         turnTrace = buildTrace(null, null, composerRecord);
-        log.info('reroll', `reusing the current note for token ${token} — extractor re-run (§4), no composer call`);
+        log.info('reroll', `reusing the note AND the extraction for token ${token} — no model calls at all (user choice)`);
     } else {
         const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
         const oldNote = storedNote ?? '';
@@ -1947,13 +1937,22 @@ function installWatcher() {
                         parsed = JSON.parse(text);
                     } catch { /* not JSON — shown raw below */ }
                     const errObj = parsed?.error;
+                    const rateLimited = res.status === 429 || /429|too many requests|rate.?limit/i.test(String(text));
+                    const rateHint = () => {
+                        if (!rateLimited) {
+                            return;
+                        }
+                        log.error('outgoing', "RATE LIMITED: the narrator shares the model's rate budget with the copilot's extractor/composer calls (they fire right before it). Fixes, in order: (1) put a different model in the extractor and composer chains in the copilot settings — the narrator then gets the whole budget; (2) set retries to 0 so a bad answer is not retried; (3) wait a minute and press Retry. The note and extraction ARE stored — only this turn's reply was lost.");
+                    };
                     if (errObj) {
                         const msg = typeof errObj === 'string' ? errObj : (errObj.message ?? JSON.stringify(errObj));
                         log.error('outgoing', `the narrator's request returned an ERROR (HTTP ${res.status}): ${redact(String(msg)).slice(0, 300)}`);
+                        rateHint();
                         return;
                     }
                     if (!res.ok) {
                         log.error('outgoing', `the narrator's request came back HTTP ${res.status}: ${redact(text).slice(0, 300)}`);
+                        rateHint();
                         return;
                     }
                     log.info('outgoing', `the narrator's request completed HTTP ${res.status}`);
@@ -2835,7 +2834,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                 composer: { ...s0.composer, prompt: undefined },
                 compressorPrompt: undefined,
             });
-            log.info('settings', 'prompt templates reset to the shipped defaults');
+            log.info('settings', 'prompt templates reset to the shipped defaults — the boxes below now show them; a later Save settings keeps them');
             renderSettings();
             render();
             return;
@@ -2884,7 +2883,13 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                 },
                 compressorPrompt: get('promptCompressor') || undefined,
             });
-            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models)`);
+            // T-R5-16 (user: "the extractor switches prompt middle of the
+            // thing"): WHICH template text was saved must be visible — a save
+            // silently re-writing an old template is otherwise undiagnosable.
+            const tplLabel = (text, shipped) => (String(text ?? '').trim() === String(shipped ?? '').trim()
+                ? 'shipped default'
+                : `customised: "${String(text ?? '').trim().slice(0, 44)}…"`);
+            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models) — extractor template: ${tplLabel(get('promptExtractor') || DEFAULT_EXTRACTOR_PROMPT, DEFAULT_EXTRACTOR_PROMPT)}; composer template: ${tplLabel(get('promptComposer') || DEFAULT_COMPOSER_PROMPT, DEFAULT_COMPOSER_PROMPT)}`);
             renderPilot();
             // T-R4-2: re-render EXPLICITLY. The log subscriber skips it while a
             // settings control has focus — which is exactly the state after a
