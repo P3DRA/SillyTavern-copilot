@@ -186,6 +186,57 @@
     border-radius: 3px;
 }
 
+/* ---- The settings section (§6 configuration surface) ---- */
+.copilot-set-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 10px;
+    margin: 6px 0;
+}
+
+.copilot-set-grid label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.copilot-settings input[type="text"],
+.copilot-settings input[type="password"],
+.copilot-settings select {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 11px;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+}
+
+.copilot-settings textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font: inherit;
+    font-size: 11px;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+}
+
+.copilot-settings details label {
+    display: block;
+    margin: 4px 0;
+}
+
+.copilot-settings summary {
+    cursor: pointer;
+    font-size: 11px;
+    opacity: 0.85;
+}
+
 /* ---- Goals and user requests (phase 4) ---- */
 .copilot-goals {
     border-top: 1px solid var(--SmartThemeBorderColor, #444);

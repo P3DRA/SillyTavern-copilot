@@ -500,6 +500,7 @@ function compressorCall(messages) {
         models: s.extractor?.chain ?? [],
         retries: s.extractor?.retries ?? 1,
         key: apiKey(),
+        baseUrl: s.baseUrl,
         messages,
         temperature: s.extractor?.temperature ?? 0.2,
         maxTokens: s.extractor?.maxTokens,
@@ -535,7 +536,7 @@ async function runManualCompression(indices) {
             return { ok: false, reason: sel.reason };
         }
         const res = await compressEntries(list, entries, indices, {
-            callModel: compressorCall, now: Date.now(),
+            callModel: compressorCall, now: Date.now(), prompt: settings().compressorPrompt,
         });
         if (!res.ok) {
             // I4: nothing changed — and the user is told (panel + log).
@@ -720,8 +721,19 @@ function injectIntoArray(prompt, note, opts) {
 
 function injectIntoString(prompt, note, opts) {
     const block = `<${NOTE_TAG}>\n${note}\n</${NOTE_TAG}>`;
+    if (opts.position === 'none') {
+        // 'none' means log-only: the note is composed, stored and bound — just
+        // never spliced into the prompt.
+        return prompt;
+    }
     if (opts.position === 'first') {
         return `${block}\n\n${prompt}`;
+    }
+    if (opts.position === 'before_last') {
+        // The string prompt is one assembled blob with no message boundaries —
+        // 'before_last' is honored on the ARRAY shape. Downgrading it here used
+        // to be SILENT (critique finding 9); it now says so (trap 14).
+        log.info('inject', "position 'before_last' is not separable in the string prompt shape — injected at end (the array shape honors it)");
     }
     return `${prompt}\n\n${block}`;
 }
@@ -1365,6 +1377,7 @@ function installPanel() {
                 <div class="copilot-lore"></div>
                 <div class="copilot-compress"></div>
                 <div class="copilot-transfer"></div>
+                <div class="copilot-settings"></div>
                 <div class="copilot-records"></div>
             </div>
         </div>`;
@@ -1698,6 +1711,109 @@ function installPanel() {
         render();
     });
 
+    // ---- The configuration surface (§6; critique F9/finding 2: every setting
+    // used to be console-only while README promised fields). Every control here
+    // is WIRED — no decorative inputs (trap 10).
+    const settingsEl = panel.querySelector('.copilot-settings');
+    const renderSettings = () => {
+        try {
+            const s = settings();
+            // Keep unsaved typing across re-renders (log lines re-render the panel).
+            const keep = {};
+            for (const el of settingsEl.querySelectorAll('[data-set]')) {
+                keep[el.dataset.set] = el.value;
+            }
+            const put = (name, v) => {
+                const el = settingsEl.querySelector(`[data-set="${name}"]`);
+                if (el) {
+                    el.value = keep[name] ?? String(v ?? '');
+                }
+            };
+            settingsEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>settings</strong>
+                    <em class="copilot-spend-note">§6 configuration — chains are comma-separated; a blank key uses the ST secret</em>
+                </div>
+                <div class="copilot-set-grid">
+                    <label>API key <input type="password" data-set="apiKey" placeholder="blank = the api_key_openrouter secret" /></label>
+                    <label>baseUrl <input type="text" data-set="baseUrl" /></label>
+                    <label>extractor chain <input type="text" data-set="extractorChain" /></label>
+                    <label>extractor temp / tokens <input type="text" data-set="extractorTemp" size="4" /> <input type="text" data-set="extractorMaxTokens" size="6" /></label>
+                    <label>composer chain <input type="text" data-set="composerChain" /></label>
+                    <label>composer temp / tokens <input type="text" data-set="composerTemp" size="4" /> <input type="text" data-set="composerMaxTokens" size="6" /></label>
+                    <label>note words min / max <input type="text" data-set="minWords" size="4" /> <input type="text" data-set="maxWords" size="4" /></label>
+                    <label>injection position
+                        <select data-set="injectPosition">
+                            <option value="end">end of the prompt</option>
+                            <option value="before_last">before the last message</option>
+                            <option value="none">none (log only)</option>
+                        </select>
+                    </label>
+                </div>
+                <details><summary>prompt templates (namespaced {{copilot.*}} blocks)</summary>
+                    <label>extractor <textarea data-set="promptExtractor" rows="5"></textarea></label>
+                    <label>composer <textarea data-set="promptComposer" rows="5"></textarea></label>
+                    <label>compressor <textarea data-set="promptCompressor" rows="5"></textarea></label>
+                </details>
+                <div class="copilot-gr-add"><button type="button" data-act="settings-save">Save settings</button></div>`;
+            put('apiKey', '');
+            put('baseUrl', s.baseUrl ?? '');
+            put('extractorChain', (s.extractor?.chain ?? []).join(', '));
+            put('extractorTemp', s.extractor?.temperature ?? 0.2);
+            put('extractorMaxTokens', s.extractor?.maxTokens ?? '');
+            put('composerChain', (s.composer?.chain ?? []).join(', '));
+            put('composerTemp', s.composer?.temperature ?? 0.7);
+            put('composerMaxTokens', s.composer?.maxTokens ?? '');
+            put('minWords', s.composer?.minWords ?? 15);
+            put('maxWords', s.composer?.maxWords ?? 120);
+            put('injectPosition', s.injection?.position ?? 'end');
+            put('promptExtractor', s.extractor?.prompt ?? '');
+            put('promptComposer', s.composer?.prompt ?? '');
+            put('promptCompressor', s.compressorPrompt ?? '');
+        } catch (err) {
+            settingsEl.textContent = `settings unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    settingsEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest?.('button[data-act="settings-save"]');
+        if (!btn) {
+            return;
+        }
+        try {
+            const get = (name) => String(settingsEl.querySelector(`[data-set="${name}"]`)?.value ?? '');
+            const chain = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
+            const num = (v, fallback) => (Number.isFinite(Number(v)) && v !== '' ? Number(v) : fallback);
+            const s = settings();
+            saveSettings({
+                ...(get('apiKey') ? { apiKey: get('apiKey') } : {}),
+                baseUrl: get('baseUrl') || DEFAULTS.baseUrl,
+                extractor: {
+                    ...s.extractor,
+                    chain: chain(get('extractorChain')),
+                    temperature: num(get('extractorTemp'), 0.2),
+                    maxTokens: num(get('extractorMaxTokens'), undefined),
+                    ...(get('promptExtractor') ? { prompt: get('promptExtractor') } : {}),
+                },
+                composer: {
+                    ...s.composer,
+                    chain: chain(get('composerChain')),
+                    temperature: num(get('composerTemp'), 0.7),
+                    maxTokens: num(get('composerMaxTokens'), undefined),
+                    minWords: num(get('minWords'), 15),
+                    maxWords: num(get('maxWords'), 120),
+                    ...(get('promptComposer') ? { prompt: get('promptComposer') } : {}),
+                },
+                injection: {
+                    ...s.injection,
+                    position: get('injectPosition') || 'end',
+                },
+                ...(get('promptCompressor') ? { compressorPrompt: get('promptCompressor') } : {}),
+            });
+            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} models in the chains)`);
+        } catch (err) {
+            log.warn('settings', `save failed: ${redact(String(err?.message ?? err))}`);
+        }
+    });
+
     // ---- The log browser (phase 3, §6): every record in the chat, one card
     // layout repeated per message/swipe, each entry editable. Editing keeps the
     // old value (I1) and an extraction edit flags its composer entry stale.
@@ -1782,7 +1898,7 @@ function installPanel() {
         if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
             && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)
             && !compressEl.contains(document.activeElement) && !transferEl.contains(document.activeElement)
-            && !loreEl.contains(document.activeElement)) {
+            && !loreEl.contains(document.activeElement) && !settingsEl.contains(document.activeElement)) {
             renderRecords();
             renderGoals();
             renderPresets();
@@ -1790,6 +1906,7 @@ function installPanel() {
             renderLore();
             renderCompress();
             renderTransfer();
+            renderSettings();
         }
     });
     render();
@@ -1800,6 +1917,7 @@ function installPanel() {
     renderLore();
     renderCompress();
     renderTransfer();
+    renderSettings();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 

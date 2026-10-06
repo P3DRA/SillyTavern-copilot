@@ -109,6 +109,7 @@ export async function runPipeline(input, deps = {}) {
             models: settings.extractor?.chain ?? [],
             retries: settings.extractor?.retries ?? 1,
             key,
+            baseUrl: settings.baseUrl,
             fetchImpl,
             messages: [
                 { role: 'system', content: extractorPrompt.text },
@@ -193,6 +194,7 @@ export async function runPipeline(input, deps = {}) {
             models: settings.composer?.chain ?? [],
             retries: settings.composer?.retries ?? 1,
             key,
+            baseUrl: settings.baseUrl,
             fetchImpl,
             messages: [
                 { role: 'system', content: composerPrompt.text },
