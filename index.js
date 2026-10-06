@@ -2192,7 +2192,11 @@ function installPanel() {
                     latestIdx = i;
                 }
             });
-            recordsEl.innerHTML = entries.map((e, i) => {
+            // Trap 8 (T-R2-12): store size is VISIBLE — a silent cap is data
+            // loss; an honest size line is not.
+            const totalBytes = entries.reduce((n, e) => n + JSON.stringify(e.record ?? {}).length, 0);
+            const sizeLine = `<div class="copilot-record-empty">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</div>`;
+            recordsEl.innerHTML = sizeLine + entries.map((e, i) => {
                 const rec = e.record;
                 const stale = rec.composer?.staleFlag === true;
                 return `
