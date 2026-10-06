@@ -36,6 +36,11 @@ import { emptySpend, recordSpend, spendSummary } from './src/core/spend.js';
 import {
     presetFromSettings, applyPreset, upsertPreset, removePreset,
 } from './src/core/presets.js';
+import {
+    compressEntries, undoCompressionAt, autoSelect, validateSelection,
+} from './src/core/compressor.js';
+import { callWithFallback } from './src/core/provider.js';
+import { pushSnapshot } from './src/schema/records.js';
 import { redact } from './src/core/redact.js';
 import {
     ctx, chat, eventSource, saveChatConditional, saveMetadata,
@@ -98,6 +103,9 @@ const DEFAULTS = {
     // Phase 5 (§6): hot-swappable extractor/composer configuration bundles.
     presets: [],
     activePreset: null,
+    // Phase 6 (§6): the compressor. Auto-compress is DEFAULT-OFF — GOAL.md §13
+    // gates enabling it by default on the G2 human review of the torture test.
+    compress: { auto: false, maxVisible: 40, mergeCount: 10 },
 };
 
 function settings() {
@@ -408,6 +416,141 @@ function deletePreset(id) {
     });
     log.info('presets', 'preset deleted');
     return { ok: true, reason: null };
+}
+
+/* ------------------------------------------------------------- compressor */
+
+/**
+ * The model call for compression: the EXTRACTOR's chain with the dedicated
+ * compress prompt (§6), judged by I4's own gate (not the composer's prose
+ * bounds — same rule as the extractor).
+ */
+function compressorCall(messages) {
+    const s = settings();
+    return callWithFallback({
+        models: s.extractor?.chain ?? [],
+        retries: s.extractor?.retries ?? 1,
+        key: apiKey(),
+        messages,
+        temperature: s.extractor?.temperature ?? 0.2,
+        maxTokens: s.extractor?.maxTokens,
+        minWords: 1,
+        maxWords: 20000,
+        onEvent: (e) => {
+            if (e.kind === 'attempt') {
+                log[e.ok ? 'info' : 'warn']('compress', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+            }
+        },
+    }).then((r) => ({
+        ok: r.ok,
+        text: r.text,
+        model: r.model ?? '',
+        tokensIn: r.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0),
+        tokensOut: r.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0),
+        reason: r.summary,
+    }));
+}
+
+/**
+ * Manual compression over visible entries (§6: the selection table). The
+ * snapshot goes into chat_metadata (I3, capped at 5) and the merged record is
+ * remembered for undo.
+ */
+async function runManualCompression(indices) {
+    try {
+        const list = chat();
+        const entries = collectExtractions(list);
+        const sel = validateSelection(indices);
+        if (!sel.ok) {
+            log.warn('compress', `refused: ${sel.reason}`);
+            return { ok: false, reason: sel.reason };
+        }
+        const res = await compressEntries(list, entries, indices, {
+            callModel: compressorCall, now: Date.now(),
+        });
+        if (!res.ok) {
+            // I4: nothing changed — and the user is told (panel + log).
+            log.warn('compress', `refused: ${res.reason}`);
+            return { ok: false, reason: res.reason };
+        }
+        recordRoleSpend('extractor', {
+            tokensIn: res.merged?.tokensIn ?? 0, tokensOut: res.merged?.tokensOut ?? 0,
+        });
+        withMeta((root) => {
+            root.snapshots = pushSnapshot(root.snapshots ?? [], res.snapshot);
+            root.lastCompression = res.merged;
+            return { ok: true, reason: null };
+        });
+        saveChatConditional?.();
+        log.info('compress', `merged ${res.originals.length} extractions into ${res.merged.id} (${res.merged.text.length} chars, sources kept)`);
+        return { ok: true, reason: null, id: res.merged.id, merged: res.originals.length };
+    } catch (err) {
+        log.error('compress', `compression threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
+}
+
+/** Undo the last compression exactly (I2). */
+function undoLastCompression() {
+    try {
+        const meta = ctx().chatMetadata?.copilot ?? {};
+        const merged = meta.lastCompression;
+        const res = undoCompressionAt(chat(), merged);
+        if (!res.ok) {
+            log.warn('compress', `undo refused: ${res.reason}`);
+            return { ok: false, reason: res.reason };
+        }
+        withMeta((root) => {
+            delete root.lastCompression;
+            return { ok: true, reason: null };
+        });
+        saveChatConditional?.();
+        log.info('compress', `undo: ${merged.sources.length} originals restored`);
+        return { ok: true, reason: null };
+    } catch (err) {
+        log.error('compress', `undo threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
+}
+
+/**
+ * Auto-compress (§6): more than `maxVisible` visible extractions → merge the
+ * `mergeCount` oldest contiguous usable run. NEVER runs unless the user turns
+ * it on — G2 gates enabling it by default.
+ */
+async function runAutoCompression() {
+    const s = settings();
+    const list = chat();
+    const entries = collectExtractions(list);
+    const indices = autoSelect(entries, {
+        maxVisible: s.compress?.maxVisible ?? 40,
+        mergeCount: s.compress?.mergeCount ?? 10,
+    });
+    if (indices.length < 2) {
+        log.info('compress', `auto: nothing to merge (${entries.length} visible, threshold ${s.compress?.maxVisible ?? 40})`);
+        return { ok: true, reason: null, merged: 0 };
+    }
+    const res = await runManualCompression(indices);
+    log.info('compress', `auto: ${res.ok ? `merged ${res.merged}` : `skipped — ${res.reason}`}`);
+    return res;
+}
+
+/** Pin (unmashable) or protect (auto-merge excludes it) one extraction. */
+function toggleEntryFlag(messageIndex, swipeIndex, field) {
+    try {
+        const message = chat()?.[Number(messageIndex)];
+        const record = readSwipeRecordOrNull(message, Number(swipeIndex));
+        if (!record?.extraction) {
+            return { ok: false, reason: 'no extraction there' };
+        }
+        record.extraction[field] = !record.extraction[field];
+        writeSwipeRecord(message, Number(swipeIndex), {});
+        log.info('compress', `extraction ${record.extraction.id}: ${field} = ${record.extraction[field]}`);
+        return { ok: true, reason: null, value: record.extraction[field] };
+    } catch (err) {
+        log.error('compress', `flag toggle threw: ${redact(String(err?.message ?? err))}`);
+        return { ok: false, reason: String((err && err.message) || err) };
+    }
 }
 
 /* ---------------------------------------------------------------- injection */
@@ -1017,6 +1160,7 @@ function installPanel() {
                 <div class="copilot-goals"></div>
                 <div class="copilot-presets"></div>
                 <div class="copilot-spend"></div>
+                <div class="copilot-compress"></div>
                 <div class="copilot-records"></div>
             </div>
         </div>`;
@@ -1199,6 +1343,68 @@ function installPanel() {
         render();
     });
 
+    // ---- The compressor (phase 6, §6): one card per visible extraction with
+    // a checkbox (contiguous selections only), pin/protect toggles, and the
+    // auto-compress controls. Auto-compress is DEFAULT-OFF (G2 gate).
+    const compressEl = panel.querySelector('.copilot-compress');
+    const renderCompress = () => {
+        try {
+            const s = settings();
+            const entries = collectExtractions(ctx().chat ?? []);
+            compressEl.innerHTML = `
+                <div class="copilot-gr-head"><strong>compressor</strong>
+                    <em class="copilot-spend-note">merge a contiguous range; originals are kept and hidden (I1/I2)</em>
+                </div>
+                <div class="copilot-gr-add">
+                    <button type="button" data-act="compress-run">Compress selected</button>
+                    <button type="button" data-act="compress-undo">Undo last compression</button>
+                </div>
+                ${entries.map((e, i) => `
+                    <div class="copilot-gr-item" data-cidx="${i}" data-mi="${e.messageIndex}" data-si="${e.swipeIndex}">
+                        <label><input type="checkbox" data-csel="${i}" /> #${i} (msg ${e.messageIndex})</label>
+                        <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
+                        <button type="button" data-act="toggle-pin">${e.extraction.pinned ? 'Unpin' : 'Pin'}</button>
+                        <button type="button" data-act="toggle-protect">${e.extraction.protected ? 'Unprotect' : 'Protect'}</button>
+                    </div>`).join('')}
+                <div class="copilot-gr-add">
+                    <label><input type="checkbox" data-cset="auto"${s.compress?.auto ? ' checked' : ''} /> auto-compress (default OFF — G2 gate)</label>
+                    <input type="text" data-cset="maxVisible" value="${escapeHtml(String(s.compress?.maxVisible ?? 40))}" size="4" title="merge only when more than this many exist" />
+                    <input type="text" data-cset="mergeCount" value="${escapeHtml(String(s.compress?.mergeCount ?? 10))}" size="4" title="how many oldest to merge" />
+                    <button type="button" data-act="compress-settings">Save</button>
+                    <button type="button" data-act="compress-auto">Run auto-compress now</button>
+                </div>`;
+        } catch (err) {
+            compressEl.textContent = `compressor unavailable: ${redact(String(err?.message ?? err))}`;
+        }
+    };
+    compressEl.addEventListener('click', async (ev) => {
+        const btn = ev.target.closest?.('button[data-act]');
+        if (!btn) {
+            return;
+        }
+        const item = btn.closest('.copilot-gr-item');
+        const act = btn.dataset.act;
+        if (act === 'compress-run') {
+            const indices = [...compressEl.querySelectorAll('[data-csel]')]
+                .filter((c) => c.checked)
+                .map((c) => Number(c.dataset.csel));
+            await runManualCompression(indices);
+        } else if (act === 'compress-undo') {
+            undoLastCompression();
+        } else if (act === 'compress-auto') {
+            await runAutoCompression();
+        } else if (act === 'compress-settings') {
+            const val = (name) => Number(compressEl.querySelector(`[data-cset="${name}"]`)?.value) || 0;
+            const auto = Boolean(compressEl.querySelector('[data-cset="auto"]')?.checked);
+            saveSettings({ compress: { auto, maxVisible: val('maxVisible') || 40, mergeCount: val('mergeCount') || 10 } });
+            log.info('compress', `settings saved: auto=${auto} maxVisible=${val('maxVisible')} mergeCount=${val('mergeCount')}`);
+        } else if ((act === 'toggle-pin' || act === 'toggle-protect') && item) {
+            toggleEntryFlag(Number(item.dataset.mi), Number(item.dataset.si), act === 'toggle-pin' ? 'pinned' : 'protected');
+        }
+        renderCompress();
+        render();
+    });
+
     // ---- The log browser (phase 3, §6): every record in the chat, one card
     // layout repeated per message/swipe, each entry editable. Editing keeps the
     // old value (I1) and an extraction edit flags its composer entry stale.
@@ -1281,11 +1487,13 @@ function installPanel() {
         render();
         // Refresh the browser/goals/spend unless the user is typing in them.
         if (!recordsEl.contains(document.activeElement) && !goalsEl.contains(document.activeElement)
-            && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)) {
+            && !spendEl.contains(document.activeElement) && !presetsEl.contains(document.activeElement)
+            && !compressEl.contains(document.activeElement)) {
             renderRecords();
             renderGoals();
             renderPresets();
             renderSpend();
+            renderCompress();
         }
     });
     render();
@@ -1293,6 +1501,7 @@ function installPanel() {
     renderGoals();
     renderPresets();
     renderSpend();
+    renderCompress();
     log.info('boot', `copilot loaded — build ${BUILD_ID}`);
 }
 
@@ -1327,6 +1536,8 @@ function init() {
         editNote, editExtraction,
         addGoal, completeGoal, addRequest, removeRequest, tick: tickChatState,
         spendTotals, savePreset, applyPresetById, deletePreset,
+        compress: runManualCompression, undoCompression: undoLastCompression,
+        autoCompress: runAutoCompression, toggleEntryFlag,
     };
 
     log.info('boot', `copilot wired up — build ${BUILD_ID}`);

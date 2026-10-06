@@ -207,9 +207,10 @@ export async function compressEntries(chat, entries, indices, deps = {}) {
         return { ok: false, reason: 'selection references missing entries' };
     }
     const inputTexts = chosen.map((e) => e.extraction.text);
+    // render() returns { text, ... } — the pipeline reads `.text` off it too.
     const promptText = render(COMPRESS_PROMPT, {
         extractions: renderEntries(chosen.map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 }))),
-    });
+    }).text;
     const res = await deps.callModel([{ role: 'system', content: promptText }]);
     if (!res || !res.ok) {
         // I4: nothing changes on a failed call either — and the user is told.

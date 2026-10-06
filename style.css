@@ -136,6 +136,32 @@
     opacity: 0.6;
 }
 
+/* ---- The compressor (phase 6) ---- */
+.copilot-c-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.85;
+}
+
+.copilot-compress label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.copilot-compress button {
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+    background: transparent;
+    color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 3px;
+}
+
 /* ---- Goals and user requests (phase 4) ---- */
 .copilot-goals {
     border-top: 1px solid var(--SmartThemeBorderColor, #444);
