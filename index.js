@@ -1893,7 +1893,10 @@ function installPanel() {
 
     panel.querySelector('[data-act="copy"]').addEventListener('click', async () => {
         try {
-            await navigator.clipboard.writeText(log.toText({ maxPerLine: 4000 }));
+            // I7 (critique finding 11): the COPY payload is the audit artifact —
+            // it must not clip ("exactly what was sent"). The panel display keeps
+            // its 400-char preview; the copy is effectively unclipped.
+            await navigator.clipboard.writeText(log.toText({ maxPerLine: 250000 }));
             log.info('panel', 'log copied to the clipboard');
         } catch (err) {
             log.error('panel', `clipboard blocked: ${redact(String((err && err.message) || err))}`);

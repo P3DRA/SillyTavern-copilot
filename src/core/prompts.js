@@ -423,6 +423,10 @@ export function detectLanguage(messagesOrText) {
     if (has(/[가-힯]/)) {
         return { code: 'ko', note: 'Hangul' };
     }
+    if (has(/[぀-ヿ]/)) {
+        // Kana is decisive for Japanese (Han alone is shared with Chinese).
+        return { code: 'ja', note: 'kana (Japanese)' };
+    }
     if (has(/[一-鿿]/)) {
         return { code: 'zh', note: 'Han characters (Chinese or Japanese)' };
     }
