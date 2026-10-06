@@ -63,14 +63,26 @@ const SETTINGS_KEY = 'copilot';
 const DEFAULTS = {
     enabled: true,
     baseUrl: 'https://openrouter.ai/api/v1',
+    // Shipped defaults per the §10.4 model matrix (tests/runs/matrix-*, live):
+    //  - extractor: ling-3.0-flash is the cheapest model that CERTIFIED on the
+    //    required <state> format AND meets the every-turn latency budget
+    //    (2/2 format at ~1.4s). dots-3-note-preview:free is the literal
+    //    cheapest certified (0/0) but takes 16-43s per extraction — kept as
+    //    the FREE fallback. ling-3.1-flash is free but was rate-limited to
+    //    unusability during the matrix (429 on 4 of 4 cells).
+    //  - composer: qwen3.7-flash is the strongest affordable model that
+    //    certified (2/2 <copilot> tag); l3-lunaris-8b is the lean fast
+    //    fallback; dots-3 as the free floor. mistral-nemo — the USER's pick to
+    //    power the NARRATOR — failed the composer tag battery 2/2 (unclosed)
+    //    and is NOT shipped as composer; the matrix is a test result.
     extractor: {
-        chain: ['inclusionai/ling-3.1-flash'],
+        chain: ['inclusionai/ling-3.0-flash', 'dots-studio/dots-3-note-preview:free'],
         retries: 1,
         temperature: 0.2,
         maxChars: 6000,
     },
     composer: {
-        chain: ['mistralai/mistral-nemo'],
+        chain: ['qwen/qwen3.7-flash', 'sao10k/l3-lunaris-8b', 'dots-studio/dots-3-note-preview:free'],
         retries: 1,
         temperature: 0.7,
         maxChars: 8000,
