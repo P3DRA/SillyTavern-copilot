@@ -171,12 +171,17 @@ export function restoreImport(chat, meta, saved) {
     // (its old `.ok` check was dead code, critique round 1 finding 18).
     restoreChat(chat, saved.snapshot);
     // Remove any swipe_info slots the import had to create — restore means
-    // EXACTLY the pre-import structure, scaffolding included.
+    // EXACTLY the pre-import structure, scaffolding included. Rebuild the array
+    // rather than splicing mid-array (T-R2-14): a splice shifts later slots
+    // onto the wrong swipes when the message has several.
     for (const slot of (saved.createdSlots ?? [])) {
         const msg = chat?.[slot.messageIndex];
-        const info = msg?.swipe_info?.[slot.swipeIndex];
-        if (info && !(info.extra && info.extra[ROOT_KEY] && typeof info.extra[ROOT_KEY] === 'object')) {
-            msg.swipe_info.splice(slot.swipeIndex, 1);
+        if (msg && Array.isArray(msg.swipe_info)) {
+            msg.swipe_info = msg.swipe_info.filter((info, si) => !(
+                si === slot.swipeIndex
+                && info
+                && !(info.extra && info.extra[ROOT_KEY] && typeof info.extra[ROOT_KEY] === 'object')
+            ));
         }
     }
     // Metadata: reset the tracked lists to the snapshot's copies — and DELETE

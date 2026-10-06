@@ -550,6 +550,7 @@ async function runManualCompression(extIds) {
         return { ok: false, reason: 'a compression is already running' };
     }
     compressionBusy = true;
+    const seqAtStart = chatSeq; // T-R2-23: refuse to commit across a chat switch
     try {
         const list = chat();
         const entries = collectExtractions(list);
@@ -571,6 +572,7 @@ async function runManualCompression(extIds) {
         }
         const res = await compressEntries(list, entries, indices, {
             callModel: compressorCall, now: Date.now(), prompt: settings().compressorPrompt,
+            shouldAbort: () => chatSeq !== seqAtStart,
         });
         if (!res.ok) {
             // I4: nothing changed — and the user is told (panel + log).
@@ -1040,6 +1042,26 @@ function onWorldInfoActivated(entries) {
  */
 const injectedTokens = new Set();
 
+/**
+ * R2-6 (I7): the audit trail for a turn, persisted on the record so it survives
+ * reloads (the DebugLog is RAM-only). Bounded with explicit markers — a cap
+ * with a marker is honest; a silent slice is a lie.
+ */
+const TRACE_CAP = 4000;
+function traceBounded(v) {
+    const s = String(v ?? '');
+    return s.length > TRACE_CAP ? `${s.slice(0, TRACE_CAP)}… [+${s.length - TRACE_CAP} chars]` : s;
+}
+function buildTrace(inputs, extraction, composer) {
+    return {
+        at: Date.now(),
+        extractorIn: traceBounded(inputs?.extractor),
+        composerIn: traceBounded(inputs?.composer),
+        extractorOut: traceBounded(extraction?.text),
+        composerOut: traceBounded(composer?.text),
+    };
+}
+
 async function onPromptReady(eventData, kind) {
     const payload = eventData ?? {};
     if (payload.dryRun) {
@@ -1115,6 +1137,7 @@ async function injectIntoUnsafe(payload, shape) {
     // turn: caught live by the S1 scenario run).
     let activeGoalIds = [];
     let activeRequestIds = [];
+    let turnTrace = null; // R2-6 (I7): persisted on the record at bind time
 
     // Phase 3: the popup's "reuse the current one" — no model call, the note
     // goes in again, and the record SAYS it was reused instead of pretending a
@@ -1137,6 +1160,7 @@ async function injectIntoUnsafe(payload, shape) {
             tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
         };
         turn.composer = composerRecord;
+        turnTrace = buildTrace(null, null, composerRecord);
         log.info('reroll', `reusing the current note for token ${token} — no model call`);
     } else {
         const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
@@ -1179,7 +1203,10 @@ async function injectIntoUnsafe(payload, shape) {
                 attemptIndex: a.attemptIndex ?? 0,
                 tokensIn: a.tokensIn ?? 0,
                 tokensOut: a.tokensOut ?? 0,
-                text: typeof a.text === 'string' ? a.text.slice(0, 2000) : '',
+                text: typeof a.text === 'string'
+                    // R2-6 (I7): never truncate SILENTLY — the marker says what was cut.
+                    ? (a.text.length > 2000 ? `${a.text.slice(0, 2000)}… [+${a.text.length - 2000} chars]` : a.text)
+                    : '',
             }));
 
             if (!composed.ok) {
@@ -1203,6 +1230,7 @@ async function injectIntoUnsafe(payload, shape) {
             lastNote = note;
             activeGoalIds = input.goalIds ?? [];
             activeRequestIds = input.requestIds ?? [];
+            turnTrace = buildTrace(composed.inputs, composed.extraction, composed.composer);
 
             // Phase 4 (§6): the diff popup on rerolls — old vs new extraction
             // and note, four options. Only when there IS an old note to diff
@@ -1280,6 +1308,7 @@ async function injectIntoUnsafe(payload, shape) {
         composer: composerRecord,
         goalIds: activeGoalIds,
         requestIds: activeRequestIds,
+        trace: turnTrace,
         model: composerRecord?.model,
         tokensIn: composerRecord?.tokensIn,
         tokensOut: composerRecord?.tokensOut,
@@ -1953,7 +1982,7 @@ function installPanel() {
             // Keep unsaved typing across re-renders (log lines re-render the panel).
             const keep = {};
             for (const el of settingsEl.querySelectorAll('[data-set]')) {
-                keep[el.dataset.set] = el.value;
+                keep[el.dataset.set] = el.type === 'checkbox' ? String(el.checked) : el.value;
             }
             const put = (name, v) => {
                 const el = settingsEl.querySelector(`[data-set="${name}"]`);
@@ -1975,10 +2004,21 @@ function installPanel() {
                     <label>composer chain <input type="text" data-set="composerChain" /></label>
                     <label>composer temp / tokens <input type="text" data-set="composerTemp" size="4" /> <input type="text" data-set="composerMaxTokens" size="6" /></label>
                     <label>note words min / max <input type="text" data-set="minWords" size="4" /> <input type="text" data-set="maxWords" size="4" /></label>
+                    <label>turn budget ms (maxWaitMs) <input type="text" data-set="maxWaitMs" size="7" /></label>
+                    <label>message window chars ext / comp <input type="text" data-set="extractorMaxChars" size="5" /> <input type="text" data-set="composerMaxChars" size="5" /></label>
+                    <label>reroll / swipe behavior
+                        <select data-set="rerollMode">
+                            <option value="ask">ask (popup)</option>
+                            <option value="new">always compose new</option>
+                            <option value="reuse">always reuse</option>
+                        </select>
+                    </label>
+                    <label><input type="checkbox" data-set="diffPopup" /> diff popup on rerolls</label>
                     <label>injection position
                         <select data-set="injectPosition">
                             <option value="end">end of the prompt</option>
                             <option value="before_last">before the last message</option>
+                            <option value="first">first</option>
                             <option value="none">none (log only)</option>
                         </select>
                     </label>
@@ -1999,6 +2039,14 @@ function installPanel() {
             put('composerMaxTokens', s.composer?.maxTokens ?? '');
             put('minWords', s.composer?.minWords ?? 15);
             put('maxWords', s.composer?.maxWords ?? 120);
+            put('maxWaitMs', s.maxWaitMs ?? 60000);
+            put('extractorMaxChars', s.extractor?.maxChars ?? 6000);
+            put('composerMaxChars', s.composer?.maxChars ?? 8000);
+            put('rerollMode', s.rerollMode ?? 'ask');
+            const dp = settingsEl.querySelector('[data-set="diffPopup"]');
+            if (dp) {
+                dp.checked = keep.diffPopup !== undefined ? keep.diffPopup === 'true' : (s.diffPopup !== false);
+            }
             put('injectPosition', s.injection?.position ?? 'end');
             put('promptExtractor', s.extractor?.prompt ?? '');
             put('promptComposer', s.composer?.prompt ?? '');
@@ -2030,11 +2078,15 @@ function installPanel() {
             saveSettings({
                 ...(get('apiKey') ? { apiKey: get('apiKey') } : {}),
                 baseUrl: get('baseUrl') || DEFAULTS.baseUrl,
+                maxWaitMs: num(get('maxWaitMs'), 60000),
+                rerollMode: get('rerollMode') || 'ask',
+                diffPopup: Boolean(settingsEl.querySelector('[data-set="diffPopup"]')?.checked),
                 extractor: {
                     ...s.extractor,
                     chain: chain(get('extractorChain')),
                     temperature: num(get('extractorTemp'), 0.2),
                     maxTokens: num(get('extractorMaxTokens'), undefined),
+                    maxChars: num(get('extractorMaxChars'), 6000),
                     ...(get('promptExtractor') ? { prompt: get('promptExtractor') } : {}),
                 },
                 composer: {
@@ -2044,6 +2096,7 @@ function installPanel() {
                     maxTokens: num(get('composerMaxTokens'), undefined),
                     minWords: num(get('minWords'), 15),
                     maxWords: num(get('maxWords'), 120),
+                    maxChars: num(get('composerMaxChars'), 8000),
                     ...(get('promptComposer') ? { prompt: get('promptComposer') } : {}),
                 },
                 injection: {

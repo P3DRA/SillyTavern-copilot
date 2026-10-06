@@ -222,6 +222,12 @@ export async function compressEntries(chat, entries, indices, deps = {}) {
     if (!v.ok) {
         return { ok: false, reason: v.reason, raw: res.text ?? '' };
     }
+    // T-R2-23 (trap 7 class): the model call above can span a chat switch —
+    // committing then would write snapshots/records into the WRONG chat. The
+    // caller passes shouldAbort; we refuse with nothing changed (I4).
+    if (typeof deps.shouldAbort === 'function' && deps.shouldAbort()) {
+        return { ok: false, reason: 'aborted before commit — the chat changed mid-compression' };
+    }
     return commitCompression(chat, chosen, v.text, {
         model: res.model ?? deps.model ?? 'compressor',
         tokensIn: res.tokensIn ?? 0,

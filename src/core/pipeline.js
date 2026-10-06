@@ -246,7 +246,11 @@ export async function runPipeline(input, deps = {}) {
                 model: a.model,
                 ok: a.ok === true,
                 rejectReason: a.ok ? null : a.reason,
-                raw: redact(String(a.text ?? '')).slice(0, 2000),
+                raw: (() => {
+                    const s = redact(String(a.text ?? ''));
+                    // R2-6 (I7): truncation is marked, never silent.
+                    return s.length > 2000 ? `${s.slice(0, 2000)}… [+${s.length - 2000} chars]` : s;
+                })(),
                 tokensIn: a.tokensIn ?? 0,
                 tokensOut: a.tokensOut ?? 0,
                 latencyMs: a.latencyMs ?? 0,

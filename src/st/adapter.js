@@ -125,6 +125,10 @@ export function setPending(note, meta = {}) {
         // the phase-1 done-when requires exactly that.
         extraction: meta.extraction ?? null,
         composer: meta.composer ?? null,
+        // R2-6 (I7): a bounded trace of the turn's inputs/outputs rides the
+        // record so the audit trail survives RELOADS (the DebugLog is RAM-only
+        // and evicts at MAX_TURNS). Truncation is marked, never silent.
+        trace: meta.trace ?? null,
         createdAt: Date.now(),
     };
     return pending;
@@ -310,6 +314,7 @@ export function bindToMessage(token) {
                 staleFlag: false,
                 edited: false,
             },
+        ...(note.trace ? { trace: note.trace } : {}),
         injection: {
             injected: note.injected !== false,
             position: note.position,

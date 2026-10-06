@@ -184,6 +184,14 @@ export class DebugLog {
                 }
                 push('    output:');
                 push(`      ${t.composer.text}`);
+            } else if (t.inputs && t.inputs.composer) {
+                // R2-6 (I7): a FAILED composer turn must still show the input it
+                // failed on — hiding it made failures undiagnosable.
+                push('  composer: FAILED — the input it failed on:');
+                push('    input:');
+                for (const line of markedInput(t, 'composer')) {
+                    push(line);
+                }
             }
             if (Array.isArray(t.attempts) && t.attempts.length > 0) {
                 push('  attempts (the fallback chain, in order):');
