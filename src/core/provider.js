@@ -196,7 +196,7 @@ export async function attempt(args) {
         body.reasoning = { effort };
     }
 
-    onEvent({ kind: 'request', model, maxTokens, messages, bodyPreview: redact(JSON.stringify(body)) });
+    onEvent({ kind: 'request', model, maxTokens, messages, title, bodyPreview: redact(JSON.stringify(body)) });
 
     // Trap 7 / F4 (critique round 1): a hung fetch must never hang the
     // generation. Implemented with a plain ref'd setTimeout + AbortController —

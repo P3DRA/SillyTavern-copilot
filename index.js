@@ -1334,6 +1334,13 @@ async function injectIntoUnsafe(payload, shape) {
 
     const s = settings();
     const turn = log.turn(turnKey(token));
+    // T-R5-13 (user: the narrator "breaks" after two messages): the panel
+    // documents maxWaitMs as the budget for "the whole extractor+composer
+    // step", but each runPipeline got the FULL budget on its own — a 60s budget
+    // could hold the narrator's request for 2 minutes. ONE deadline for the
+    // whole step; every stage gets only what is LEFT of it.
+    const turnDeadline = Date.now() + (Number(s.maxWaitMs) > 0 ? Number(s.maxWaitMs) : 60000);
+    const budgetLeft = () => Math.max(1000, turnDeadline - Date.now());
 
     // S5/I5: garbage output ends the turn with NO note — the chat continues.
     // The previous note is reused ONLY by explicit user choice (the reroll
@@ -1372,7 +1379,7 @@ async function injectIntoUnsafe(payload, shape) {
         try {
             const ex = await runPipeline(input, {
                 key: apiKey(),
-                deadlineMs: s.maxWaitMs,
+                deadlineMs: budgetLeft(),
                 extractOnly: true,
                 onEvent: (e) => log.info('pipeline', `reuse-turn extractor: ${e.kind}`),
             });
@@ -1402,7 +1409,7 @@ async function injectIntoUnsafe(payload, shape) {
         for (;;) {
             const composed = await runPipeline(input, {
                 key: apiKey(),
-                deadlineMs: s.maxWaitMs,
+                deadlineMs: budgetLeft(),
                 onEvent: (e) => {
                     if (e.kind === 'attempt') {
                         // A rejected attempt is a FAILURE and must be visible as one
@@ -1916,8 +1923,46 @@ function installWatcher() {
         } catch (err) {
             log.error('outgoing', `watcher failed: ${redact(String(err?.message ?? err))}`);
         }
-        const res = await original(input, init);
+        let res;
+        try {
+            res = await original(input, init);
+        } catch (err) {
+            // T-R5-14: a request that dies at the FETCH layer (aborted, blocked
+            // by the browser, network down) used to leave NO trace at all — the
+            // user just saw the narrator never answer. Name the killer.
+            if (watched) {
+                log.error('outgoing', `the narrator's request FAILED before completing: ${redact(String(err?.name ?? 'Error'))}: ${redact(String(err?.message ?? err))}`);
+            }
+            throw err;
+        }
         if (watched) {
+            // T-R5-14: the HTTP outcome IS the evidence. "the narrator didn't
+            // answer" must never be a mystery again — status first, then the
+            // error body when there is one.
+            try {
+                const bodyClone = res.clone();
+                bodyClone.text().then((text) => {
+                    let parsed = null;
+                    try {
+                        parsed = JSON.parse(text);
+                    } catch { /* not JSON — shown raw below */ }
+                    const errObj = parsed?.error;
+                    if (errObj) {
+                        const msg = typeof errObj === 'string' ? errObj : (errObj.message ?? JSON.stringify(errObj));
+                        log.error('outgoing', `the narrator's request returned an ERROR (HTTP ${res.status}): ${redact(String(msg)).slice(0, 300)}`);
+                        return;
+                    }
+                    if (!res.ok) {
+                        log.error('outgoing', `the narrator's request came back HTTP ${res.status}: ${redact(text).slice(0, 300)}`);
+                        return;
+                    }
+                    log.info('outgoing', `the narrator's request completed HTTP ${res.status}`);
+                }).catch(() => {
+                    if (!res.ok) {
+                        log.error('outgoing', `the narrator's request came back HTTP ${res.status} (body unreadable)`);
+                    }
+                });
+            } catch { /* clone refused — nothing to read */ }
             // Spend (§6): the NARRATOR's provider-reported usage, read from the
             // response. A streamed response reports nothing (PROBLEMS.md §4) —
             // counted as zero and SAID so, never estimated.
