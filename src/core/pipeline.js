@@ -128,6 +128,13 @@ export async function runPipeline(input, deps = {}) {
             onEvent,
         });
         result.attempts.push(...extractResult.attempts);
+        // F14 (critique round 1): the extractor's <state> contract was never
+        // checked at runtime — garbage prose was stored and fed to the composer
+        // as "facts". LENIENT on purpose (§6's garbage rule targets the note):
+        // a missed format is a recorded quality warning, not a hard reject.
+        if (extractResult.ok && extractResult.text && !/<state>[\s\S]*<\/state>/i.test(extractResult.text)) {
+            onEvent({ kind: 'extractor-format-warning', detail: 'no <state> block in the output — stored as-is, format contract missed' });
+        }
         const extIn = extractResult.attempts.reduce((n, a) => n + (a.tokensIn || 0), 0);
         const extOut = extractResult.attempts.reduce((n, a) => n + (a.tokensOut || 0), 0);
         result.tokensIn += extIn;

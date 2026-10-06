@@ -53,6 +53,13 @@ import {
 
 const log = new DebugLog();
 
+// F12 (critique round 1): turn ids must be unique ACROSS chats. resetTokens()
+// zeroes the generation token on every chat change, so chat B's turn "1" used
+// to REUSE chat A's turn record — showing its skipReason/failure/noteFound on
+// the wrong chat (I7: "what the panel shows is exactly what was sent").
+let chatSeq = 0;
+const turnKey = (token) => `${chatSeq}:${token}`;
+
 /** Where the API key and configuration live inside SillyTavern's settings. */
 const SETTINGS_KEY = 'copilot';
 
@@ -988,7 +995,7 @@ async function injectIntoUnsafe(payload, shape) {
     }
 
     const s = settings();
-    const turn = log.turn(String(token));
+    const turn = log.turn(turnKey(token));
 
     // S5/I5: garbage output ends the turn with NO note — the chat continues.
     // The previous note is reused ONLY by explicit user choice (the reroll
@@ -1234,7 +1241,7 @@ function onMessageReceived() {
         injectedTokens.delete(token);
         return;
     }
-    const turn = log.turn(String(token));
+    const turn = log.turn(turnKey(token));
     if (result.bound) {
         const what = result.skipped ? 'skip record' : 'note';
         turn.injection = `${turn.injection ?? what} -> bound to message ${result.messageIndex} swipe ${result.swipeIndex}`;
@@ -1277,6 +1284,7 @@ function maybeAutoCompress() {
 
 function onChatChanged() {
     // Trap 7: everything in flight is abandoned on a chat change.
+    chatSeq += 1; // F12: turn ids never collide across chats
     const droppedOnSwitch = clearPending(SKIP.CHAT_CHANGED);
     resetTokens();
     injectedTokens.clear();
@@ -1313,7 +1321,7 @@ function installWatcher() {
             const isBackend = /\/api\/backends\/(chat-completions|text-completions)\/generate/.test(url);
             if (isBackend && typeof init?.body === 'string') {
                 watched = true;
-                const turn = log.turn(String(currentTokenSafe()));
+                const turn = log.turn(turnKey(currentTokenSafe()));
                 turn.outgoingPromptSeen = true;
                 turn.outgoingBody = init.body;
                 const check = verifyInOutgoing(init.body, lastNote ?? '');
