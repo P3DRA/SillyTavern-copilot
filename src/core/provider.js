@@ -174,10 +174,12 @@ export async function attempt(args) {
 
     // Trap 7 / F4 (critique round 1): a hung fetch must never hang the
     // generation. Implemented with a plain ref'd setTimeout + AbortController —
-    // portable everywhere (where AbortSignal.timeout/any are missing there used
-    // to be NO timeout at all, and Node's AbortSignal.timeout timer is unref'd,
-    // which silently skipped the timeout in tests).
-    const timeoutMs = args.timeoutMs ?? 120000;
+    // portable everywhere. m1 (round 3): when a deadlineAt is given, EACH
+    // attempt sees the REMAINING budget — the old per-stage number let a hung
+    // chain hold ST's awaited hook ≈ #attempts × stageBudget.
+    const timeoutMs = Number.isFinite(args.deadlineAt)
+        ? Math.max(500, args.deadlineAt - Date.now())
+        : (args.timeoutMs ?? 120000);
     const timeoutController = new AbortController();
     const timeoutTimer = setTimeout(() => timeoutController.abort(), timeoutMs);
     let effectiveSignal = timeoutController.signal;

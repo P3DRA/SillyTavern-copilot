@@ -111,10 +111,10 @@ export async function runPipeline(input, deps = {}) {
             key,
             baseUrl: settings.baseUrl,
             fetchImpl,
-            // T-R2-7: every attempt is bounded by the REMAINING turn budget —
-            // the deadline used to be checked only BETWEEN stages, so a hung
-            // chain could hold ST's awaited hook for many minutes.
-            timeoutMs: Math.max(500, deadlineMs - (Date.now() - started)),
+            // T-R2-7 + m1: every attempt is bounded by the REMAINING turn
+            // budget (deadlineAt) — a hung chain can no longer hold ST's
+            // awaited hook for #attempts × the stage budget.
+            deadlineAt: started + deadlineMs,
             messages: [
                 { role: 'system', content: extractorPrompt.text },
                 { role: 'user', content: renderMessages(extractWindow.messages) },
@@ -177,6 +177,20 @@ export async function runPipeline(input, deps = {}) {
             });
         }
 
+        // M4 (§4): extractOnly — a REUSE turn runs a new extractor ("a swipe
+        // means a new extractor run") and reuses only the note. The composer
+        // is skipped entirely; the caller stores the fresh extraction beside
+        // the reused note.
+        if (deps.extractOnly) {
+            return Object.assign(result, {
+                ok: true,
+                reason: null,
+                note: null,
+                composer: null,
+                elapsedMs: Date.now() - started,
+            });
+        }
+
         // ---- 2. Composer ----
         const composerWindow = fitMessages(input.messages, settings.composer?.maxChars ?? 8000);
         const noteBudget = {
@@ -211,8 +225,8 @@ export async function runPipeline(input, deps = {}) {
             key,
             baseUrl: settings.baseUrl,
             fetchImpl,
-            // T-R2-7: same remaining-budget bound as the extractor.
-            timeoutMs: Math.max(500, deadlineMs - (Date.now() - started)),
+            // T-R2-7 + m1: same remaining-budget bound as the extractor.
+            deadlineAt: started + deadlineMs,
             messages: [
                 { role: 'system', content: composerPrompt.text },
                 { role: 'user', content: 'Write the guidance note.' },

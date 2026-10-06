@@ -1193,20 +1193,41 @@ async function injectIntoUnsafe(payload, shape) {
     const storedNote = lastNote ?? stash?.composer?.text ?? previousNoteFor(chat());
     const wantsReuse = Boolean(rerollChoice && rerollChoice.token === token
         && rerollChoice.choice === 'reuse' && storedNote);
+    let input = await collectInput(token);
     if (wantsReuse) {
         note = storedNote;
         turn.reroll = 'reused the previous note (user choice)';
+        // M4 (§4): "A swipe means a new extractor run" — only the NOTE is
+        // reused; the extraction is recomputed against the CURRENT turn. Before
+        // this, reuse ran NOTHING and served the pre-edit note to boot.
+        try {
+            const ex = await runPipeline(input, {
+                key: apiKey(),
+                deadlineMs: s.maxWaitMs,
+                extractOnly: true,
+                onEvent: (e) => log.info('pipeline', `reuse-turn extractor: ${e.kind}`),
+            });
+            if (ex.spend?.extractor) {
+                recordRoleSpend('extractor', ex.spend.extractor);
+            }
+            extractionRecord = ex.extraction ?? null;
+            turn.extraction = extractionRecord;
+            if (!ex.ok) {
+                log.warn('pipeline', `reuse turn: extractor failed (${ex.reason}) — the note is reused without a fresh extraction`);
+            }
+        } catch (err) {
+            log.warn('pipeline', `reuse turn: extractor threw: ${redact(String(err?.message ?? err))}`);
+        }
         composerRecord = {
             text: note, model: '(reused from the previous turn)',
             tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
         };
         turn.composer = composerRecord;
         turnTrace = buildTrace(null, null, composerRecord);
-        log.info('reroll', `reusing the current note for token ${token} — no model call`);
+        log.info('reroll', `reusing the current note for token ${token} — extractor re-run (§4), no composer call`);
     } else {
         const isRerollTurn = Boolean(rerollChoice && rerollChoice.token === token);
         const oldNote = storedNote ?? '';
-        let input = await collectInput(token);
         const oldExtraction = (input.extractions ?? []).at(-1)?.text ?? '';
         let rerolls = 0;
         for (;;) {
@@ -2233,7 +2254,9 @@ function installPanel() {
                     temperature: num(get('extractorTemp'), 0.2),
                     maxTokens: num(get('extractorMaxTokens'), undefined),
                     maxChars: num(get('extractorMaxChars'), 6000),
-                    ...(get('promptExtractor') ? { prompt: get('promptExtractor') } : {}),
+                    // m2: an EMPTY box means "use the built-in template" — the
+                    // old `? :` silently kept the previous prompt (trap 10).
+                    prompt: get('promptExtractor') || undefined,
                 },
                 composer: {
                     ...s.composer,
@@ -2243,13 +2266,13 @@ function installPanel() {
                     minWords: num(get('minWords'), 15),
                     maxWords: num(get('maxWords'), 120),
                     maxChars: num(get('composerMaxChars'), 8000),
-                    ...(get('promptComposer') ? { prompt: get('promptComposer') } : {}),
+                    prompt: get('promptComposer') || undefined,
                 },
                 injection: {
                     ...s.injection,
                     position: get('injectPosition') || 'end',
                 },
-                ...(get('promptCompressor') ? { compressorPrompt: get('promptCompressor') } : {}),
+                compressorPrompt: get('promptCompressor') || undefined,
             });
             log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} models in the chains)`);
         } catch (err) {
