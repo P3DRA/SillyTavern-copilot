@@ -2700,7 +2700,16 @@ function init() {
 
     installWatcher();
     installPanel();
-    refreshSecretKey(); // R2-8: seed the ST-secret cache at boot
+    // R2-8: seed the ST-secret cache at boot. When it settles, log WHERE the
+    // key came from (never the key) — this line is also what re-renders the
+    // pilot light, which otherwise could stay on its boot-time state until the
+    // next turn.
+    refreshSecretKey().then(() => {
+        const src = apiKeySource();
+        log.info('boot', src
+            ? `API key resolved from ${src === 'panel' ? 'the panel field' : "ST's OpenRouter secret"}`
+            : `no API key resolved yet — ${apiKeyProblem()}`);
+    });
 
     // Exposed for the T3 driver and for the user in the console. Never holds a
     // secret: the settings VIEW redacts the key (F14 — it used to return the

@@ -341,6 +341,25 @@
     display: flex;
     gap: 4px;
     margin-bottom: 4px;
+    /* User report: settings wider than an extension — rows wrap instead of
+       overflowing the drawer. */
+    flex-wrap: wrap;
+}
+
+/* User report: the compressor's two numeric boxes were "too tiny to know what
+   they do". They sit inside <label> wrappers, which were not flex containers —
+   so `size="4"` governed the width. The labels now lay out as rows and the
+   inputs stretch; a floor keeps them usable at any width. */
+.copilot-gr-add label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 190px;
+    min-width: 0;
+}
+
+.copilot-gr-add label input[type="text"] {
+    min-width: 56px;
 }
 
 .copilot-gr-add input[type="text"] {

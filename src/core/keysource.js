@@ -109,5 +109,8 @@ export function keyProblem(sources = {}) {
     if (sources.secretStatus === 'unreadable') {
         return "ST's OpenRouter secret exists, but this server does not expose key values to the browser (set allowKeysExposure: true in config.yaml). Easier fix: type the key into the Copilot panel's API key field.";
     }
+    if (sources.secretStatus === 'unknown') {
+        return "still checking ST's key store — if this stays, type the key into the Copilot panel's API key field.";
+    }
     return 'no API key anywhere — type one into the Copilot panel\'s API key field. (A blank field can fall back to ST\'s OpenRouter secret, but only a server with allowKeysExposure: true can read it.)';
 }
