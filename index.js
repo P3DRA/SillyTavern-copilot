@@ -781,7 +781,12 @@ async function runManualCompression(extIds) {
     const seqAtStart = chatSeq; // T-R2-23: refuse to commit across a chat switch
     try {
         const list = chat();
-        const entries = collectExtractions(list);
+        // T-R5-25 (user: "Compressor is compressing only swipe 0 and not active
+        // swipes"; selections over mixed lists were refused as non-contiguous):
+        // the compressor operates on exactly what the panel LIST shows — the
+        // ACTIVE swipe's extractions. ids map to indices in THIS list, so the
+        // contiguity check finally matches what the user saw when ticking.
+        const entries = collectExtractions(list, { currentSwipeOnly: true });
         // T-R2-10 (F18): selections are resolved by EXTRACTION ID against the
         // fresh list — render-time indices silently selected different entries
         // after any intervening turn or auto-merge.
@@ -857,7 +862,9 @@ function undoLastCompression() {
 async function runAutoCompression() {
     const s = settings();
     const list = chat();
-    const entries = collectExtractions(list);
+    // T-R5-25: same active-swipe list as the panel and runManualCompression —
+    // one notion of "the entries" everywhere.
+    const entries = collectExtractions(list, { currentSwipeOnly: true });
     const indices = autoSelect(entries, {
         maxVisible: s.compress?.maxVisible ?? 40,
         mergeCount: s.compress?.mergeCount ?? 10,
@@ -1920,7 +1927,9 @@ function maybeAutoCompress() {
         if (!s.compress?.auto) {
             return;
         }
-        const entries = collectExtractions(chat());
+        // T-R5-25: the auto threshold counts ACTIVE extractions only ("it
+        // should run only when the number of active ones reaches it").
+        const entries = collectExtractions(chat(), { currentSwipeOnly: true });
         const threshold = s.compress?.maxVisible ?? 40;
         // R2-31: decide with autoSelect's notion of MERGEABLE (usable run), not
         // a raw visible count — the mismatch spammed "nothing to merge" every
@@ -2456,13 +2465,15 @@ function installPanel() {
             const s = settings();
             const list = ctx().chat ?? [];
             // T-R4-9 (user report): only the CURRENT swipe's facts belong here —
-            // merging facts from other swipes mixes realities. Facts already
-            // compressed away stay visible as history, marked 📦, without a
-            // checkbox (they are already folded).
+            // merging facts from other swipes mixes realities.
+            //
+            // T-R5-25: compression HISTORY is not swipe-dependent. The merged
+            // result ("it effectively replaces the last one") and the folded
+            // originals must stay visible as 📦 rows however the user swipes
+            // ("when i leave to any other swipe it changes and hides it").
             const entries = collectExtractions(list, { currentSwipeOnly: true });
             const visibleIds = new Set(entries.map((e) => e.extraction.id));
             const folded = listRecords(list)
-                .filter((e) => e.isCurrentSwipe)
                 .flatMap((e) => [
                     ...(e.record.extraction ? [{ extraction: e.record.extraction, messageIndex: e.messageIndex, swipeIndex: e.swipeIndex }] : []),
                     ...(Array.isArray(e.record.extractions) ? e.record.extractions.filter(Boolean).map((x) => ({ extraction: x, messageIndex: e.messageIndex, swipeIndex: e.swipeIndex })) : []),
@@ -2474,7 +2485,7 @@ function installPanel() {
                     <div class="copilot-gr-item" data-cidx="${e.extraction.id}" title="extraction ${escapeHtml(String(e.extraction.id))} from message ${e.messageIndex}.${e.swipeIndex}">
                         ${tickable
                             ? `<label title="Tick to include in a compression. Only a contiguous run of ticks can be merged."><input type="checkbox" data-csel="${e.extraction.id}" /> ${box}#${e.messageIndex}.${e.swipeIndex}</label>`
-                            : `<span class="copilot-c-text">${box}#${e.messageIndex}.${e.swipeIndex} (compressed)</span>`}
+                            : `<span class="copilot-c-text">${box}#${e.messageIndex}.${e.swipeIndex} (${e.extraction.sources?.length ? 'merged' : 'compressed'})</span>`}
                         <span class="copilot-c-text">${escapeHtml(String(e.extraction.text ?? '').slice(0, 90))}</span>
                         <button type="button" data-act="view-extraction" data-ext-id="${e.extraction.id}" title="Open the FULL extraction in a popup — readable and editable. Save rewrites it and flags the note stale.">View/Edit</button>
                         ${tickable ? `
