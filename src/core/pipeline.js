@@ -224,17 +224,24 @@ export async function runPipeline(input, deps = {}) {
             maxWords: settings.composer?.maxWords ?? LIMITS.MAX_WORDS,
         };
         const composerPrompt = render(settings.composer?.prompt ?? DEFAULT_COMPOSER_PROMPT, {
-            // T-R4-6: the composer reads the CURRENT STATE — the fresh state
-            // from this turn (which already contains the earlier facts by
-            // construction), labelled with when it was taken so the composer
-            // knows the timing of events (user report: "extractions come
-            // unlabelled as to when they were taken"). It is NOT handed the
-            // whole extraction pile any more — that grows without bound.
-            extractions: result.extraction.text
-                ? `(state as of this turn — just recorded)\n${result.extraction.text}`
-                : (String(input.previousState ?? '').trim()
-                    ? `(state as of message ${Number(input.previousStateSource ?? 0) + 1})\n${input.previousState}`
-                    : '(no state recorded yet)'),
+            // T-R5-20 (user: "it's eating extractions and a copilot only
+            // receives their respective extraction but they should receive all
+            // that are available, with the compressor being there exactly to
+            // keep the number of them low"): the composer reads EVERY visible
+            // extraction — each labelled with when it was taken — plus the one
+            // just produced. The T-R4-6 state-only feed was wrong: a state doc
+            // can drop a fact when the model replaces instead of merges, and
+            // then the composer never sees it at all. Keeping the list short is
+            // the COMPRESSOR's job (union merge), not this block's.
+            extractions: (() => {
+                const all = renderEntries([
+                    ...(input.extractions ?? []),
+                    ...(result.extraction.text
+                        ? [{ text: result.extraction.text, label: 'THIS TURN — just recorded' }]
+                        : []),
+                ]);
+                return all || '(nothing recorded yet)';
+            })(),
             lastMessages: renderMessages(composerWindow.messages),
             lorebook: input.lorebook ?? '',
             characterCard: input.characterCard ?? '',

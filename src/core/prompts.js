@@ -116,8 +116,9 @@ WHAT YOU ARE WORKING FROM
 Recent chat messages:
 {{copilot.lastMessages}}
 
-The current story state — every fact with the place and time it belongs to
-(this is what has been recorded so far, not a list to pile up):
+Everything recorded so far — every extraction, each labelled with the message
+it was taken at (the story's recorded state; the compressor keeps this list
+short, so treat it as complete):
 {{copilot.extractions}}
 
 Goals the reader has set for the STORY (these should move toward happening):
@@ -378,7 +379,9 @@ export function renderEntries(entries) {
     }
     return usable
         .map((e, i) => {
-            const src = e.source ? `from message ${e.source}` : `no. ${i + 1}`;
+            // T-R5-20: an entry may carry its own label ("THIS TURN — just
+            // recorded"); otherwise the source message dates it.
+            const src = e.label ?? (e.source ? `from message ${e.source}` : `no. ${i + 1}`);
             const pinned = e.pinned ? ', pinned' : '';
             const merged = e.sources?.length ? `, merged from ${e.sources.length}` : '';
             // T-R5-18 (user: "it's not receiving more than 1 extraction"): each
