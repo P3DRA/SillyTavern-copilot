@@ -205,5 +205,5 @@ and you can save your own and delete yours (shipped bundles stay).
 
 ## License / credits
 
-License: TBD — see LICENSE. Build `copilot-phase8-r14` (shown in the panel);
+License: TBD — see LICENSE. Build `copilot v0.1.0` (shown in the panel);
 tested against SillyTavern 1.18.0.

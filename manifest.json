@@ -3,7 +3,7 @@
   "loading_order": 100,
   "js": "index.js",
   "css": "style.css",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "author": "Copilot Build",
   "homePage": "",
   "auto_update": false,

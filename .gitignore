@@ -19,3 +19,8 @@ desktop.ini
 # secret.md; see GOAL.md 9.2.
 *.key
 secret.md
+# dev-only — not part of the user-facing release
+PRODUCTION-READY.md
+RELEASE-READINESS.md
+STORAGE-SIZE-REPORT.md
+tools/
