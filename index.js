@@ -312,6 +312,16 @@ function narratorPromptText() {
  */
 async function collectInput(turnId) {
     const list = chat();
+    // T-R5-17 (user report): on a swipe/reroll the reply being REGENERATED is
+    // still in the chat while the new swipe is composed — and the new swipe's
+    // composer used to read the very swipe it is replacing ("a composer of
+    // swipe 2 for msg4 receives msg4 swipe 1 as input"). On a swipe turn the
+    // trailing ASSISTANT message is the one being replaced and is dropped from
+    // every window. A user-message swipe keeps its (new) text.
+    const lastMsg = list[list.length - 1];
+    const dropLast = currentTurnType === 'swipe'
+        && Boolean(lastMsg) && !lastMsg.is_user && !lastMsg.is_system;
+    const endIdx = dropLast ? list.length - 1 : list.length;
     const messages = [];
     const window = settings().composer.maxChars;
     // User-facing knob: HOW MANY recent messages (the old chars window was
@@ -319,7 +329,7 @@ async function collectInput(turnId) {
     const maxMessages = Number(settings().composer.maxMessages ?? 20) || 20;
     // Walk backwards so a budget drops whole OLDEST messages (trap 4).
     let used = 0;
-    for (let i = list.length - 1; i >= 0; i -= 1) {
+    for (let i = endIdx - 1; i >= 0; i -= 1) {
         const m = list[i];
         const text = typeof m?.mes === 'string' ? m.mes : '';
         if (text.trim() === '' || m?.is_system) {
@@ -361,13 +371,28 @@ async function collectInput(turnId) {
         // The DELTA is built from the full chat (not the composer's window cap)
         // and the pipeline's own extractor budget trims it afterwards.
         extractMessages = [];
-        for (let i = previousStateSource + 1; i < list.length; i += 1) {
+        for (let i = previousStateSource + 1; i < endIdx; i += 1) {
             const m = list[i];
             const text = typeof m?.mes === 'string' ? m.mes : '';
             if (text.trim() === '' || m?.is_system) {
                 continue;
             }
             extractMessages.push({ role: m.is_user ? 'user' : 'assistant', text });
+        }
+        if (extractMessages.length === 0) {
+            // Everything visible is already folded into the state (a reroll of
+            // the last reply). The old code fell back to the WHOLE transcript
+            // here, which re-sent the entire chat (and the swipe being replaced)
+            // as "new messages". The honest delta is the position being
+            // answered: the last user message.
+            for (let i = endIdx - 1; i >= 0; i -= 1) {
+                const m = list[i];
+                const text = typeof m?.mes === 'string' ? m.mes : '';
+                if (m?.is_user && text.trim() !== '') {
+                    extractMessages = [{ role: 'user', text }];
+                    break;
+                }
+            }
         }
     } else {
         extractMessages = messages;
@@ -655,12 +680,35 @@ function deletePreset(id) {
 /* ------------------------------------------------------------- compressor */
 
 /**
+ * T-R5-18: a template SAVED in the settings pins whatever shipped text existed
+ * when it was saved — later fixes never reach it (the user's compressor ran the
+ * old "Prose, no lists, no headers" merger and returned prose). Recognise the
+ * OLD shipped signatures and say so, once per kind per session.
+ */
+const warnedTemplates = new Set();
+function warnLegacyTemplate(kind, text) {
+    if (warnedTemplates.has(kind)) {
+        return;
+    }
+    const t = String(text ?? '');
+    const legacy = (kind === 'extractor' && t.includes('<ledger>'))
+        || (kind === 'composer' && t.includes('Facts recorded so far:'))
+        || (kind === 'compressor' && t.includes('Prose, no lists, no headers'));
+    if (!legacy) {
+        return;
+    }
+    warnedTemplates.add(kind);
+    log.warn('settings', `the ${kind} template in your settings is an OLDER shipped version — later fixes do not reach it. Press 'Restore shipped prompts' (then Save settings) to get the current format, or keep it deliberately.`);
+}
+
+/**
  * The model call for compression: the EXTRACTOR's chain with the dedicated
  * compress prompt (§6), judged by I4's own gate (not the composer's prose
  * bounds — same rule as the extractor).
  */
 function compressorCall(messages) {
     const s = settings();
+    warnLegacyTemplate('compressor', s.compressorPrompt ?? DEFAULT_COMPRESSOR_PROMPT);
     return callWithFallback({
         // The compressor has its own chain (the user asked for a model
         // selector); it falls back to the extractor's chain.
@@ -959,6 +1007,8 @@ let lastNote = null;
 let rerollChoice = null;
 /** R2-1: what kind of generation is in flight — only 'real' may compose/inject. */
 let generationKind = 'none';
+/** T-R5-17: the ST generation type of the current turn ('normal', 'swipe', …). */
+let currentTurnType = 'normal';
 /** T-R2-4: exactly what was delivered this turn — the watcher verifies THIS. */
 let deliveredNote = null;
 /** T-R2-5: one compression at a time. */
@@ -1110,6 +1160,7 @@ async function onGenerationStarted(type, opts = {}, dryRun = false) {
         return;
     }
     lastToken = nextToken(); // kept in sync by construction (R2-20: one counter)
+    currentTurnType = String(type ?? 'normal');
     lorebookEntries = new Map();
     clearNote();
     const droppedPending = clearPending(SKIP.STALE_GENERATION);
@@ -1341,6 +1392,8 @@ async function injectIntoUnsafe(payload, shape) {
     // whole step; every stage gets only what is LEFT of it.
     const turnDeadline = Date.now() + (Number(s.maxWaitMs) > 0 ? Number(s.maxWaitMs) : 60000);
     const budgetLeft = () => Math.max(1000, turnDeadline - Date.now());
+    warnLegacyTemplate('extractor', s.extractor?.prompt ?? DEFAULT_EXTRACTOR_PROMPT);
+    warnLegacyTemplate('composer', s.composer?.prompt ?? DEFAULT_COMPOSER_PROMPT);
 
     // S5/I5: garbage output ends the turn with NO note — the chat continues.
     // The previous note is reused ONLY by explicit user choice (the reroll
@@ -2889,7 +2942,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
             const tplLabel = (text, shipped) => (String(text ?? '').trim() === String(shipped ?? '').trim()
                 ? 'shipped default'
                 : `customised: "${String(text ?? '').trim().slice(0, 44)}…"`);
-            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models) — extractor template: ${tplLabel(get('promptExtractor') || DEFAULT_EXTRACTOR_PROMPT, DEFAULT_EXTRACTOR_PROMPT)}; composer template: ${tplLabel(get('promptComposer') || DEFAULT_COMPOSER_PROMPT, DEFAULT_COMPOSER_PROMPT)}`);
+            log.info('settings', `settings saved from the panel (${chain(get('extractorChain')).length}/${chain(get('composerChain')).length} extractor/composer models) — extractor template: ${tplLabel(get('promptExtractor') || DEFAULT_EXTRACTOR_PROMPT, DEFAULT_EXTRACTOR_PROMPT)}; composer template: ${tplLabel(get('promptComposer') || DEFAULT_COMPOSER_PROMPT, DEFAULT_COMPOSER_PROMPT)}; compressor template: ${tplLabel(get('promptCompressor') || DEFAULT_COMPRESSOR_PROMPT, DEFAULT_COMPRESSOR_PROMPT)}`);
             renderPilot();
             // T-R4-2: re-render EXPLICITLY. The log subscriber skips it while a
             // settings control has focus — which is exactly the state after a

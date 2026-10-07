@@ -377,13 +377,16 @@ export function renderEntries(entries) {
         return '';
     }
     return usable
-        .map((e) => {
-            const src = e.source ? ` (from message ${e.source})` : '';
-            const pinned = e.pinned ? ' [pinned]' : '';
-            const merged = e.sources?.length ? ` [merged from ${e.sources.length}]` : '';
-            return `- ${e.text.trim()}${src}${pinned}${merged}`;
+        .map((e, i) => {
+            const src = e.source ? `from message ${e.source}` : `no. ${i + 1}`;
+            const pinned = e.pinned ? ', pinned' : '';
+            const merged = e.sources?.length ? `, merged from ${e.sources.length}` : '';
+            // T-R5-18 (user: "it's not receiving more than 1 extraction"): each
+            // entry gets its own labelled block. The old "- text" list form made
+            // several multi-line state docs read as ONE blob to the compressor.
+            return `=== extraction ${src}${pinned}${merged} ===\n${e.text.trim()}`;
         })
-        .join('\n');
+        .join('\n\n');
 }
 
 /**
