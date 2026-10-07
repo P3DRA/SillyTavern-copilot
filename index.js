@@ -358,41 +358,41 @@ async function collectInput(turnId) {
     // is the newest visible extraction; the extractor gets ONLY the messages not
     // yet folded into it — never the whole chat again ("the extractor is
     // receiving ALL messages, that makes no sense").
-    let previousState = '';
-    let previousStateSource = -1;
-    for (const e of visible) {
-        if (e.messageIndex > previousStateSource && String(e.extraction.text ?? '').trim()) {
-            previousState = String(e.extraction.text);
-            previousStateSource = e.messageIndex;
-        }
-    }
-    let extractMessages;
-    if (previousStateSource >= 0) {
-        // The DELTA is built from the full chat (not the composer's window cap)
-        // and the pipeline's own extractor budget trims it afterwards.
-        extractMessages = [];
-        for (let i = previousStateSource + 1; i < endIdx; i += 1) {
+    // T-R5-21 (user spec): the state chain, newest last. KEY SEMANTIC: an
+    // extraction produced during message N's generation covers the messages up
+    // to N-1 (N's reply does not exist yet when it runs) and is then BOUND to
+    // message N. So the next delta must start AT the binding — otherwise the
+    // narrator's own reply at N is never extracted by anyone ("a new one
+    // extracted from msg2 and 3" for the msg4 turn — not just msg3).
+    const bindings = [...new Set(visible.map((e) => e.messageIndex))].sort((a, b) => a - b);
+    const latestBinding = bindings.length ? bindings[bindings.length - 1] : -1;
+    const beforeLatest = bindings.length > 1 ? bindings[bindings.length - 2] : -1;
+    const latestEntry = visible
+        .filter((e) => e.messageIndex === latestBinding && String(e.extraction.text ?? '').trim())
+        .at(-1);
+    const previousState = latestEntry ? String(latestEntry.extraction.text) : '';
+    const previousStateSource = latestBinding;
+    const spanFrom = (from) => {
+        const out = [];
+        for (let i = Math.max(0, from); i < endIdx; i += 1) {
             const m = list[i];
             const text = typeof m?.mes === 'string' ? m.mes : '';
             if (text.trim() === '' || m?.is_system) {
                 continue;
             }
-            extractMessages.push({ role: m.is_user ? 'user' : 'assistant', text });
+            out.push({ role: m.is_user ? 'user' : 'assistant', text });
         }
+        return out;
+    };
+    let extractMessages;
+    if (latestBinding >= 0) {
+        extractMessages = spanFrom(latestBinding);
         if (extractMessages.length === 0) {
-            // Everything visible is already folded into the state (a reroll of
-            // the last reply). The old code fell back to the WHOLE transcript
-            // here, which re-sent the entire chat (and the swipe being replaced)
-            // as "new messages". The honest delta is the position being
-            // answered: the last user message.
-            for (let i = endIdx - 1; i >= 0; i -= 1) {
-                const m = list[i];
-                const text = typeof m?.mes === 'string' ? m.mes : '';
-                if (m?.is_user && text.trim() !== '') {
-                    extractMessages = [{ role: 'user', text }];
-                    break;
-                }
-            }
+            // Everything up to endIdx is already covered (a reroll of the reply
+            // the chain already spans). The fresh extraction should cover the
+            // SAME span as the turn it replaces — from the previous binding —
+            // so the chain stays whole: "extracted from msg2 and 3".
+            extractMessages = spanFrom(beforeLatest >= 0 ? beforeLatest : Math.max(0, latestBinding - 1));
         }
     } else {
         extractMessages = messages;
