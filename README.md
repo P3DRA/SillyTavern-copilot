@@ -207,3 +207,19 @@ and you can save your own and delete yours (shipped bundles stay).
 
 License: AGPL-3.0 (see LICENSE). Build `copilot v0.1.0` (shown in the panel);
 tested against SillyTavern 1.18.0.
+
+## Known issue: chat file size
+
+Copilot keeps a full audit trail **inside the chat file** — for every turn and
+swipe, the exact prompts sent to the models and their outputs — so nothing is
+ever silently lost and everything can be inspected in the records browser. The
+cost is size: in testing, a 7-message chat with records reached ~172 KB.
+
+This is known and will be remedied in a future version ("slim storage"): the
+audit text will be stored **once per turn** instead of being duplicated across
+records, mirrors and rollback snapshots, and snapshots will store deltas. The
+projected size for the same chat is ~64 KB (−63%) with every audit guarantee
+intact — plus an opt-in "audit mode" that restores today's layout verbatim.
+
+Until then, chat files with copilot data are bigger than usual. Nothing is
+wrong with them — they are simply thorough.
