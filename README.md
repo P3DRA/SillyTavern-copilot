@@ -223,3 +223,10 @@ intact — plus an opt-in "audit mode" that restores today's layout verbatim.
 
 Until then, chat files with copilot data are bigger than usual. Nothing is
 wrong with them — they are simply thorough.
+
+## Compatibility
+
+Built and tested against **SillyTavern 1.18**. SillyTavern **1.19 is NOT
+guaranteed** to work with this version — extension APIs move between ST
+releases, so if you are on 1.19 and something misbehaves, that is the first
+suspect. A 1.19-compatible line is planned (the next version line).
