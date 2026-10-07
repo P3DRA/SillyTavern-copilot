@@ -158,6 +158,9 @@ export async function attempt(args) {
     const record = {
         model, ok: false, reason: null, detail: '', text: '', reasoning: '',
         tokensIn: 0, tokensOut: 0, latencyMs: 0, finishReason: null, status: null,
+        // T-R5-24: which agent this attempt belongs to — shown in the log so
+        // the user can verify it against the provider's activity table.
+        title,
     };
 
     const finish = (patch = {}) => {
@@ -184,6 +187,11 @@ export async function attempt(args) {
         max_tokens: maxTokens,
         temperature,
         stream: false, // usage is not returned on a stream (verified, phase 0)
+        // T-R5-24: third identification channel. OpenRouter's activity "App"
+        // column has been observed filling from whatever it grabbed (the same
+        // call labelled differently across tables), so the role rides in `user`
+        // (visible in request details) too.
+        user: title,
     };
     if (json) {
         body.response_format = { type: 'json_object' };
@@ -224,7 +232,11 @@ export async function attempt(args) {
             headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${key}`,
-                'HTTP-Referer': 'https://sillytavern.github.io/SillyTavern-Docs/',
+                // T-R5-24: the provider's "App" column falls back to the
+                // Referer — so the role rides there too, not just in X-Title.
+                // Whichever channel its UI reads, it shows WHICH copilot agent
+                // (extractor / composer / compressor) made the call.
+                'HTTP-Referer': `https://sillytavern.github.io/SillyTavern-Docs/?app=${encodeURIComponent(title)}`,
                 'X-Title': title,
             },
             body: JSON.stringify(body),

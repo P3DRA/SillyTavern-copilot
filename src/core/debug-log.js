@@ -27,7 +27,7 @@ import { redact } from './redact.js';
  * Changes on every build of this file. Bump it when shipping a change whose
  * effect you need to be able to confirm from a pasted log.
  */
-export const BUILD_ID = 'copilot-phase8-r12';
+export const BUILD_ID = 'copilot-phase8-r13';
 
 const MAX_EVENTS = 500;
 

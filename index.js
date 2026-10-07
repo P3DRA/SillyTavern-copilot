@@ -750,7 +750,7 @@ function compressorCall(messages) {
         maxWords: 20000,
         onEvent: (e) => {
             if (e.kind === 'attempt') {
-                log[e.ok ? 'info' : 'warn']('compress', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                log[e.ok ? 'info' : 'warn']('compress', `${e.model} [${e.title ?? 'copilot'}]: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
             }
         },
     }).then((r) => ({
@@ -1497,7 +1497,7 @@ async function injectIntoUnsafe(payload, shape) {
                     if (e.kind === 'attempt') {
                         // A rejected attempt is a FAILURE and must be visible as one
                         // (phase 2: "failures are shown"), not a quiet info line.
-                        log[e.ok ? 'info' : 'warn']('provider', `${e.model}: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
+                        log[e.ok ? 'info' : 'warn']('provider', `${e.model} [${e.title ?? 'copilot'}]: ${e.ok ? 'ok' : `rejected (${e.reason}) — ${e.detail}`}`);
                         if (!e.ok && /HTTP 40[13]/i.test(String(e.detail ?? ''))) {
                             log.error('provider', 'AUTHENTICATION REJECTED (401/403) — the provider refused the API key. Fixes, in order: (1) open the Copilot settings and paste the key into the API key field — a stray space or quote breaks it (it is trimmed automatically now) — then press Save settings; (2) if the field is blank and the key lives in ST\'s OpenRouter secret instead, this server must have allowKeysExposure: true in config.yaml, otherwise extensions cannot read that secret at all. Send one more message after fixing.');
                         }
