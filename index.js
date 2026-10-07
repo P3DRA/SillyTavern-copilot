@@ -1093,8 +1093,8 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
         const call = ctx().callGenericPopup;
         const POPUP_TYPE = ctx().POPUP_TYPE;
         if (!call || !POPUP_TYPE) {
-            log.warn('reroll', 'no popup API in the ST context — defaulting to the benign answer (keep the old note)');
-            return 'old';
+            log.warn('reroll', 'no popup API in the ST context — keeping the fresh composition (what was asked for)');
+            return 'new';
         }
         const block = (label, text) => `<div class="copilot-diff-block"><strong>${escapeHtml(label)}</strong><pre>${escapeHtml(String(text ?? '(none)'))}</pre></div>`;
         const html = `<div class="copilot-diff">
@@ -1104,8 +1104,16 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
             ${block('OLD note', oldNote)}
             ${block('NEW note', newNote)}
         </div>`;
-        // Benign default on timeout = 'old' (keep what was; the no-change
-        // answer — T-R2-13: it used to default to 'new', the money answer).
+        // T-R5-19 (user: "The extractor should run every swipe that asks for a
+        // new composer … it's currently re using the same extraction"): this
+        // popup only ever appears AFTER the user explicitly asked for a fresh
+        // composition — and the fresh extraction+note are already computed and
+        // paid for. The timeout default must therefore honour that request:
+        // 'new'. The old T-R2-13 default ('old', "the money answer") silently
+        // discarded the paid-for result and re-injected the previous swipe's
+        // note — the exact wrong answer to what was asked. 5 minutes because
+        // this is a READING popup (four diff blocks); trap 7 is preserved (it
+        // still auto-resolves and can never hang the generation).
         return await popupWithTimeout(
             call(html, POPUP_TYPE.CONFIRM, null, {
                 okButton: 'Use the NEW note',
@@ -1126,11 +1134,11 @@ async function askDiffChoice(oldExtraction, newExtraction, oldNote, newNote) {
                 }
                 return 'old';
             }),
-            60000, 'old', 'diff popup',
+            300000, 'new', 'diff popup',
         );
     } catch (err) {
-        log.warn('reroll', `diff popup failed — defaulting to the benign answer (keep the old note): ${redact(String(err?.message ?? err))}`);
-        return 'old';
+        log.warn('reroll', `diff popup failed — keeping the fresh composition (what was asked for): ${redact(String(err?.message ?? err))}`);
+        return 'new';
     }
 }
 
@@ -1529,14 +1537,18 @@ async function injectIntoUnsafe(payload, shape) {
                 break;
             }
             if (choice === 'old') {
+                // T-R5-19: 'Use the OLD note' is a choice about the NOTE. The
+                // FRESH extraction stands — it matches the current message,
+                // which is exactly why the extractor re-runs on every new
+                // composition (user requirement) — and the kept note is flagged
+                // stale because it was written against the older extraction.
                 note = oldNote;
-                extractionRecord = null;
                 composerRecord = {
                     text: note, model: '(reused — diff popup: use old)',
-                    tokensIn: 0, tokensOut: 0, createdAt: Date.now(), staleFlag: false, edited: false,
+                    tokensIn: 0, tokensOut: 0, createdAt: Date.now(),
+                    staleFlag: true, staleReason: 'kept the old note against a fresh extraction',
                 };
                 turn.composer = composerRecord;
-                turn.extraction = null;
                 break;
             }
             if (choice === 'cancel') {
