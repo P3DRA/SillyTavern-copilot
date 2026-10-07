@@ -349,8 +349,16 @@ async function collectInput(turnId) {
     // Extractions the composer may read: everything up to and including the
     // message we are answering, excluding the slot being written. Compressed
     // originals are excluded here and ONLY here (I2).
+    //
+    // T-R5-22 (user: "composer receives extractions from inactive swipes ...
+    // only the active ones get sent"): only the ACTIVE swipe of each message
+    // counts. The live `msg.swipe_id` IS the active marker — it moves the
+    // moment the user switches swipes, so no extra storage is needed and it can
+    // never go stale. An inactive swipe's extraction is kept on disk (I1) but
+    // must not leak into the composer's list.
     const visible = collectExtractions(list, {
         excludeSwipeAt: { messageIndex: list.length, swipeIndex: 0 },
+        currentSwipeOnly: true,
     });
     const extractions = visible.map((e) => ({ text: e.extraction.text, source: e.messageIndex + 1 }));
 
@@ -488,6 +496,22 @@ async function readPermanentLorebook() {
 }
 
 // noteTextOf now comes from src/schema/records.js (R2-27: it was duplicated).
+/** The ACTIVE-swipe record of the latest message that has one (note or extraction). */
+function previousRecordFor(list) {
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+        const m = list[i];
+        if (m?.is_user) {
+            continue;
+        }
+        const info = m?.swipe_info?.[m.swipe_id ?? 0];
+        const rec = info?.extra?.copilot?.record;
+        if (rec && (noteTextOf(rec) || rec.extraction)) {
+            return rec;
+        }
+    }
+    return null;
+}
+
 function previousNoteFor(list) {
     for (let i = list.length - 1; i >= 0; i -= 1) {
         const m = list[i];
@@ -1069,7 +1093,7 @@ async function askRerollChoice() {
         // Benign default on timeout = 'reuse' (no model call — decision record 4).
         return await popupWithTimeout(
             PopupCls.show.confirm(
-                'Copilot note for this swipe',
+                'The composer\'s note for this swipe',
                 'Compose a NEW composer note for this generation, or REUSE the current one?',
                 { okButton: 'Compose a new note', cancelButton: 'Reuse the current note' },
             ).then((result) => (result === 1 ? 'new' : 'reuse')),
@@ -1440,7 +1464,15 @@ async function injectIntoUnsafe(payload, shape) {
         // money and rate budget for a near-identical extraction and is exactly
         // what the user did not ask for. Deviation from GOAL §4's "a swipe means
         // a new extractor run" is deliberate and recorded in PROGRESS.md.
-        const prevExtraction = stash?.extraction ?? null;
+        // T-R5-22 (user: a 'reuse' reroll left the new swipe's record with a
+        // NULL extractor): the reused extraction comes from the SAME record the
+        // reused note comes from. The stash only exists when ST DELETED the
+        // previous message (a regenerate); a swipe ADD leaves the old record in
+        // place and the copy must come from there — "msg4 swipe 2 is empty but
+        // as it reuses the same composer & extraction from msg4 swipe 1 it
+        // should receive that".
+        const prevRecord = stash ?? previousRecordFor(chat());
+        const prevExtraction = prevRecord?.extraction ?? null;
         extractionRecord = prevExtraction
             ? { ...JSON.parse(JSON.stringify(prevExtraction)), model: '(reused from the previous turn)', reused: true }
             : null;
@@ -1679,6 +1711,53 @@ function editNote(messageIndex, swipeIndex, text) {
 
 function editExtraction(messageIndex, swipeIndex, text) {
     return editRecordField(messageIndex, swipeIndex, 'extraction', text);
+}
+
+/**
+ * T-R5-23: a plain-text dump of every record in the chat, in the user's own
+ * report format — one block per message (separated by `#---`), one per swipe
+ * when a message has several, extractor and composer outputs indented under
+ * their labels:
+ *
+ *   msg4
+ *     swipe 0
+ *       extractor
+ *         …
+ *       composer
+ *         …
+ */
+function recordsDump() {
+    const entries = listRecords(chat());
+    const byMsg = new Map();
+    for (const e of entries) {
+        if (!byMsg.has(e.messageIndex)) {
+            byMsg.set(e.messageIndex, []);
+        }
+        byMsg.get(e.messageIndex).push(e);
+    }
+    const indent = (text, tabs) => String(text ?? 'null')
+        .split('\n')
+        .map((l) => `${'\t'.repeat(tabs)}${l}`)
+        .join('\n');
+    const blocks = [];
+    for (const [mi, recs] of [...byMsg.entries()].sort((a, b) => a[0] - b[0])) {
+        const multi = recs.length > 1;
+        const labelTabs = multi ? 2 : 1;
+        const out = [`msg${mi}`];
+        for (const e of recs) {
+            if (multi) {
+                out.push(`\tswipe ${e.swipeIndex}`);
+            }
+            const ex = e.record.extraction?.text
+                ?? (Array.isArray(e.record.extractions) ? e.record.extractions.map((x) => x?.text).filter(Boolean).join('\n\n') : '');
+            out.push(`${'\t'.repeat(labelTabs)}extractor`);
+            out.push(indent(ex || 'null', labelTabs + 1));
+            out.push(`${'\t'.repeat(labelTabs)}composer`);
+            out.push(indent(e.record.composer?.text || 'null', labelTabs + 1));
+        }
+        blocks.push(out.join('\n'));
+    }
+    return blocks.join('\n#---\n');
 }
 
 /**
@@ -3001,10 +3080,10 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                     latestIdx = i;
                 }
             });
-            // Trap 8 (T-R2-12): store size is VISIBLE — a silent cap is data
+            // T-R5-23: store size is VISIBLE — a silent cap is data
             // loss; an honest size line is not.
             const totalBytes = entries.reduce((n, e) => n + JSON.stringify(e.record ?? {}).length, 0);
-            const sizeLine = `<div class="copilot-record-empty" title="One card per message/swipe that has copilot data. Record sizes are always reported — never silently capped.">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</div>`;
+            const sizeLine = `<div class="copilot-gr-add"><button type="button" data-act="copy-records" title="Copy every record in this chat to the clipboard as plain text: one block per message, one per swipe, with the extractor and composer outputs.">Copy records</button><em class="copilot-badge" title="One card per message/swipe that has copilot data. Record sizes are always reported — never silently capped.">${entries.length} records — ~${Math.round(totalBytes / 1024)}KB of record data (sizes are shown, never silently capped)</em></div>`;
             // T-R4-10 (user layout): every swipe folds INSIDE its message —
             // "message {n}" is the outer fold, one fold per swipe beneath it.
             const byMessage = new Map();
@@ -3035,7 +3114,7 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
                             <textarea data-field="extraction" rows="3" title="Extracted facts for this turn. Edit and press Save extraction to keep the change.">${escapeHtml(rec.extraction?.text ?? '')}</textarea>
                             <button type="button" data-act="save-extraction" title="Store this edited extraction. The matching note is flagged as possibly stale.">Save extraction</button>
                         </details>
-                        <details class="copilot-fold"><summary>copilot</summary>
+                        <details class="copilot-fold"><summary>composer</summary>
                             <label title="The exact prompt text the composer model received.">input</label>
                             <pre>${escapeHtml(String(tr.composerIn ?? noInput))}</pre>
                             <label title="The &lt;copilot&gt; guidance note that was injected into the narrator's prompt for this turn.">output</label>
@@ -3062,6 +3141,19 @@ established fact, not as an instruction to generate feeling. Then the facts.`),
     recordsEl.addEventListener('click', (ev) => {
         const btn = ev.target.closest?.('button[data-act]');
         if (!btn) {
+            return;
+        }
+        // T-R5-23: dump every record in the chat to the clipboard.
+        if (btn.dataset.act === 'copy-records') {
+            (async () => {
+                try {
+                    await navigator.clipboard.writeText(recordsDump());
+                    log.info('panel', 'records copied to the clipboard (one block per message, one per swipe)');
+                } catch (err) {
+                    log.error('panel', `clipboard blocked: ${redact(String((err && err.message) || err))}`);
+                }
+                render();
+            })();
             return;
         }
         // T-R4-10: the swipe fold carries the coordinates now (swipes live

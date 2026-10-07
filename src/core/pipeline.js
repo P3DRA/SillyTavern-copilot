@@ -107,15 +107,23 @@ export async function runPipeline(input, deps = {}) {
             || '(none yet — this is the first extraction)';
         const extractorPrompt = render(settings.extractor?.prompt ?? DEFAULT_EXTRACTOR_PROMPT, {
             lastMessages: renderMessages(extractWindow.messages),
-            // The state placeholders: the new template reads previousState, and
-            // older custom templates that said {{copilot.extractions}} still get
-            // the same content instead of an empty block.
+            // T-R5-22 (user): the shipped template is MOMENTARY — it records one
+            // moment and never restates earlier extractions ("the extractor is
+            // momentary... he's not a compressor"). But the template SYSTEM
+            // offers the composer's full block set on purpose: a user writing
+            // their own extractor prompt may want the lorebook, goals, the
+            // previous state, anything — so everything is rendered when asked.
             previousState,
-            extractions: previousState,
+            extractions: renderEntries(input.extractions ?? []),
             lorebook: input.lorebook ?? '',
             characterCard: input.characterCard ?? '',
             narratorPrompt: input.narratorPrompt ?? '',
+            userRequest: input.userRequest ?? '',
+            goals: renderGoalFacts(input.goals ?? []),
+            previousNote: input.previousNote ?? '',
             language: language.code ?? 'en',
+            minWords: String(settings.composer?.minWords ?? ''),
+            maxWords: String(settings.composer?.maxWords ?? ''),
         });
         onEvent({ kind: 'extract-start', messages: extractWindow.messages.length, dropped: extractWindow.dropped });
         result.inputs.extractor = `${extractorPrompt.text}\n\n${renderMessages(extractWindow.messages)}`;
