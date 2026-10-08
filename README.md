@@ -235,6 +235,6 @@ suspect. A 1.19-compatible line is planned (the next version line).
 
 This version was tested exclusively against **OpenRouter** (openrouter.ai) —
 including the rate-limit handling, usage/spend accounting and the provider
-debug labels. The code speaks any OpenAI-compatible endpoint (the aseUrl
+debug labels. The code speaks any OpenAI-compatible endpoint (the baseUrl
 field in settings), but **no other endpoint has been tested**. Others may
 work, treat them as unverified.
